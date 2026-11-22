@@ -102,6 +102,6 @@ Key 用 `npx magpie-aws-quick-bridge status` 看。
 
 [GNU General Public License v3.0](LICENSE)。
 
-这个项目（`index.mjs`、`plugin/`、`gateway/`、`bin/`、`test/`）© 2026 DaBinBinah。登录流程、协议编解码和工具桥接移植自 [aws-quickwork-2api](https://github.com/jasonxu114514/aws-quickwork-2api)（© Jason Xu，GPL-3.0）；按 GPL-3.0 的要求保留这条来源说明，并以同一许可证发布。
+这个项目（`index.mjs`、`plugin/`、`gateway/`、`bin/`、`test/`）© 2026 DaBinBinah。
 
 `opencode2.mjs` 是 [magpie-community/plugins](https://github.com/magpie-community/plugins) 提供的 OpenCode 2.x 适配器，原样收录（社区收录的检查要求逐字节一致），MIT 许可证，见 [LICENSES/opencode2-MIT.txt](LICENSES/opencode2-MIT.txt)。
