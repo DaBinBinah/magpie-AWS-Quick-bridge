@@ -9,7 +9,6 @@
 
 import { timingSafeEqual } from "node:crypto"
 import { createServer } from "node:http"
-import { Readable } from "node:stream"
 import { MODES, chatCompletions, mapModel } from "../plugin/chat.mjs"
 import * as oauth from "../plugin/oauth.mjs"
 import * as qbs from "../plugin/qbs.mjs"
@@ -163,10 +162,16 @@ export function listen(handle, { port, host }) {
       const answer = await handle(new Request(`http://${req.headers.host || "localhost"}${req.url}`, { method: req.method, headers, body, signal: abort.signal }))
       res.writeHead(answer.status, Object.fromEntries(answer.headers))
       if (!answer.body) return res.end()
-      const stream = Readable.fromWeb(answer.body)
-      stream.on("error", () => res.destroy())
-      res.on("close", () => stream.destroy())
-      stream.pipe(res)
+      // Read and written one chunk at a time: Readable.fromWeb(...).pipe(res)
+      // delivers chunks out of order on Bun 1.3.11.
+      const reader = answer.body.getReader()
+      res.on("close", () => reader.cancel().catch(() => {}))
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) return res.end()
+        if (!res.write(value)) await new Promise((next) => res.once("drain", next).once("close", next))
+        if (res.destroyed) return
+      }
     } catch (e) {
       if (res.headersSent) return res.destroy()
       res.writeHead(500, { "content-type": "application/json" })
