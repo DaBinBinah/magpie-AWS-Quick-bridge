@@ -3,20 +3,16 @@
 // its answer is rewritten back, streamed or whole.
 
 import { randomUUID } from "node:crypto"
+import { agentNeutral } from "../plugin/messages.mjs"
 import { eventStream, failure, textOf, turnEvents, turnResult } from "./sse.mjs"
 
 const TYPES = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 529: "overloaded_error" }
 
 export const error = (status, message) => Response.json({ type: "error", error: { type: TYPES[status] ?? "api_error", message } }, { status })
 
-// Claude Code opens its system prompt with a billing line meant for
-// Anthropic; it changes with every request and says nothing to the model.
-const system = (value) =>
-  textOf(typeof value === "string" ? [{ type: "text", text: value }] : value)
-    .split("\n")
-    .filter((line) => !line.startsWith("x-anthropic-billing-header:"))
-    .join("\n")
-    .trim()
+// Claude Code's billing line and its "You are Claude Code" opening are
+// taken care of where every caller's instructions are read (agentNeutral).
+const system = (value) => agentNeutral(textOf(typeof value === "string" ? [{ type: "text", text: value }] : value))
 
 function image(block) {
   const s = block?.source

@@ -75,7 +75,10 @@ sequenceDiagram
 - 每个请求打开一条到 Amazon Quick 的 WebSocket，把要发送的消息转成一条 `user_message`：单条用户消息原样发送，多轮对话和工具结果按 `User:` / `Assistant tool call (...)` / `Tool result (...)` 渲染。
 - 线程复用：Magpie 通过 `chat.headers` 钩子把会话 ID 带给插件；同一账号、同一会话、历史前缀一致的请求会接到上一轮的服务端线程上，只发新增消息，系统提示词没变也不重发。历史被改写（压缩、回退）或线程缓存过期（内存里保留 6 小时）时，开新线程重发全部历史。
 - 64 KB 帧上限：按“完整工具定义 → 一行签名 → 缩短系统提示词（最多占半帧）→ 过长内容转附件 → 截断较早的内容”的顺序处理，直到一帧放得下。附件经 Amazon Quick 的上传接口和 DLP 检查后挂到线程上，由模型用它自己的文件工具读取。
-- 工具只在客户端执行：插件把模型输出的 `<client_tool_call>{"name":…,"arguments":…}</client_tool_call>` 转成 `tool_calls`，下一轮再把工具结果作为文本带回去。`tool_choice: "none"` 关闭桥接，指定函数时只接受该函数。
+- 工具只在客户端执行：插件把模型输出的 `<client_tool_call>{"name":…,"arguments":…}</client_tool_call>` 转成 `tool_calls`，下一轮再把工具结果作为文本带回去。`tool_choice: "none"` 关闭桥接，指定函数时只接受该函数。带工具的每条消息末尾还会加一句提醒：文件和终端在用户自己的电脑上，要用上面的标记调用工具，Amazon Quick 自带的工具看不到这台电脑。没有这句时，`fast` 档常常直接去用自带工具找文件。
+- 系统提示词放在 `custom_prompt` 里。agent 开头那句自报家门（如 “You are Claude Code, Anthropic's official CLI for Claude.”）会换成一句“这段对话来自用户电脑上的编程 agent”，Claude Code 的计费头那一行会去掉：Amazon Quick 不是这些产品，被要求扮演时容易纠结身份而不干活。
+- 用户用中文、日文或韩文写的时候（看最近 4 条用户消息里用户自己打的字），带工具的请求会多一句说明：用这种语言思考和回复，工具参数里的文件名、路径、日志、报错和搜索词照原文抄，不要翻译。Amazon Quick 默认用英文思考，会把中文日志翻成英文再去搜，结果搜不到。
+- 模型名里方括号的部分（如 Claude Code 的 `[1m]`）不算名字的一部分，`advanced[1m]` 就是 `advanced`。
 - 出错时尽量用 Magpie 能处理的状态回答：上游拒绝登录回 401（账号被标记为需要重新登录），限流回 429，超时回 504，其他上游错误回 502，Magpie 据此切换到下一个账号或模型。回复开始之后的错误只能写进流里。
 
 代码结构：
@@ -164,7 +167,7 @@ m provider test aws-quick
 
 ## 限制
 
-- **真实上游的验证范围**：我用自己的个人账号（social）对真实的 Amazon Quick 验证过浏览器登录、流式对话、系统提示词、思考输出、工具调用循环、线程复用、附件上传和额度查询。企业账号（IAM Identity Center）、`gateway` / `social_gateway` 的 CBOR 路径、advanced 模式和图片附件只对仓库里的模拟上游或单元测试验证过。在 Magpie 里的安装、登录、粘贴回调登录、经网关请求和 `magpie quota` 是对模拟上游验证的。
+- **真实上游的验证范围**：我用自己的个人账号（social）对真实的 Amazon Quick 验证过浏览器登录、流式对话、系统提示词、思考输出、工具调用循环、线程复用、附件上传和额度查询；0.3.3 的中文日志搜索（Claude Code 的 `fast` 和默认档、Codex、Chat Completions）和带 `[1m]` 后缀的模型名也是对真实账号验证的。企业账号（IAM Identity Center）、`gateway` / `social_gateway` 的 CBOR 路径、advanced 模式和图片附件只对仓库里的模拟上游或单元测试验证过。在 Magpie 里的安装、登录、粘贴回调登录、经网关请求和 `magpie quota` 是对模拟上游验证的。
 - **CC Switch 模式的验证范围**：在我的 Mac 上用真实账号让 Claude Code、Codex、OpenCode 经本机 API 完成了读文件、写文件的工具调用；企业账号登录和 macOS 后台服务没有用真实账号验证。Gemini CLI 用的是另一种接口格式，目前不支持。
 - 只有聊天。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 返回 400。
 - 输入是文本和 `data:` URL 形式的图片；远程图片地址、音频、文件会变成 `[image]`、`[audio]`、`[file]` 占位。

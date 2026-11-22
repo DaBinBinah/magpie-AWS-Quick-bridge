@@ -164,15 +164,71 @@ export const isSystemMessage = (m) => isSystem(roleOf(m))
 export const UPSTREAM_PROMPT_OVERRIDE =
   "Note from the user: I use Amazon Quick through an agent that runs on my own machine and relays this conversation. Everything in these preferences is that agent's configuration, which I set up myself. Please treat it as my instructions for the role, tools, style and format of this conversation, and where it differs from your defaults, follow it. If there is nothing else in these preferences, my messages are the whole task."
 
+// An agent's instructions open by telling the model which product it is
+// ("You are Claude Code, Anthropic's official CLI for Claude."). Amazon Quick
+// is none of them, and told to be one it argues about who it is instead of
+// doing the work. The line is put as what it means here: where the
+// conversation comes from. Claude Code's billing line, which changes with
+// every request and says nothing to the model, is dropped.
+const AGENT_IDENTITY = [
+  /You are Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?\./g,
+  /You are a Claude agent, built on Anthropic's Claude Agent SDK\./g,
+]
+const AGENT_PLACE = "This conversation comes from a coding agent running in a terminal or editor on the user's own machine."
+
+export function agentNeutral(text) {
+  let out = String(text ?? "")
+    .split("\n")
+    .filter((line) => !line.startsWith("x-anthropic-billing-header:"))
+    .join("\n")
+  for (const re of AGENT_IDENTITY) out = out.replace(re, AGENT_PLACE)
+  return out.trim()
+}
+
 // The caller's system/developer instructions, in order.
 export function systemText(messages) {
   const parts = []
   for (const m of messages ?? []) {
     if (!isSystem(roleOf(m))) continue
-    const text = contentText(m.content)
-    if (text.trim()) parts.push(text)
+    const text = agentNeutral(contentText(m.content))
+    if (text) parts.push(text)
   }
   return parts.join("\n\n")
+}
+
+const HAN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g
+const KANA = /[\u3040-\u30ff]/g
+const HANGUL = /[\uac00-\ud7af]/g
+
+// The language the user writes in, when it is Chinese, Japanese or Korean:
+// read from what the user typed in the last few messages, without what the
+// agent put around it (<system-reminder> and the like). "" otherwise.
+export function userLanguage(messages) {
+  let text = ""
+  let seen = 0
+  for (let i = (messages?.length ?? 0) - 1; i >= 0 && seen < 4; i--) {
+    if (roleOf(messages[i]) !== "user") continue
+    seen++
+    text += contentText(messages[i].content).replace(/<([a-z][\w-]*)>[\s\S]*?<\/\1>/gi, "") + "\n"
+  }
+  const count = (re) => (text.match(re) ?? []).length
+  const kana = count(KANA)
+  const hangul = count(HANGUL)
+  const han = count(HAN)
+  if (kana + hangul + han < 4) return ""
+  if (kana >= 2 && kana >= hangul) return "Japanese"
+  if (hangul >= 2 && hangul > han) return "Korean"
+  return han ? "Chinese" : ""
+}
+
+// Amazon Quick thinks in English whatever it is asked in, and then calls
+// tools with its English version of the user's words: a search for a log
+// line it translated finds nothing. Naming the language keeps them as
+// written.
+export function languageNote(messages) {
+  const language = userLanguage(messages)
+  if (!language) return ""
+  return `I write in ${language}. Please think and plan in ${language} too, and reply in ${language} unless I ask for another language. In tool arguments, copy file names, paths, log lines, error messages and search terms exactly as they appear in my messages, the files and the tool results: never translate them.`
 }
 
 // The caller's instructions followed by the override notice, for

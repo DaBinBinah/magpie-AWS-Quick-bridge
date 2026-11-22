@@ -84,6 +84,13 @@ export function buildToolBridgePrompt(tools, functions, mode, name, parallel, co
   return lines.join("\n")
 }
 
+// custom_prompt sits among Amazon Quick's own long instructions, and the
+// model does not always keep to it: it looks for the user's files with its
+// built-in tools, or calls a client tool through them. These lines end each
+// message of a turn with tools, where it reads them last.
+export const TOOL_REMINDER =
+  '[Note from my agent: the files and the shell this is about are on my own machine. To reach them, write a client tool call as plain text, as my preferences describe: <client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call>. Your built-in tools run on a remote service: they cannot see my machine, and a client tool called through them fails as an unknown tool.]'
+
 function parseEnvelopes(payload) {
   const text = payload.trim()
   if (!text) return []

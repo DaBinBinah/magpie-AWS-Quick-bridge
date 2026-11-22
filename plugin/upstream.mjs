@@ -38,7 +38,7 @@ export const FRAME_LIMIT = 65_536
 // frame.
 export function userMessage(session, cfg, input) {
   const payload = {
-    text: input.prompt,
+    text: input.reminder ? `${input.prompt}\n\n${input.reminder}` : input.prompt,
     send_origin: "programmatic",
     had_physical_input: false,
     surfaceType: session.surface,

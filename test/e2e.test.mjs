@@ -154,8 +154,11 @@ describe("chat", () => {
       ],
     })
     expect(mock.state.turns.at(-1).text).toBe(
-      `User: weather in Paris?\n\nAssistant tool call (id=${call.id}, name=get_weather): {"city":"Paris"}\n\nTool result (call_id=${call.id}, name=get_weather): 18°C`,
+      `User: weather in Paris?\n\nAssistant tool call (id=${call.id}, name=get_weather): {"city":"Paris"}\n\nTool result (call_id=${call.id}, name=get_weather): 18°C\n\n${_internal.toolbridge.TOOL_REMINDER}`,
     )
+    // a turn without tools ends with the caller's own words
+    await post({ model: "smart", messages: [{ role: "user", content: "ping" }] })
+    expect(mock.state.turns.at(-1).text).toBe("ping")
   })
 
   test("tool_choice none turns the bridge off", async () => {
@@ -234,14 +237,14 @@ describe("a conversation over several requests", () => {
     await post({ model: "smart", tools, messages }, { headers })
     const two = mock.state.turns.at(-1)
     expect(two.thread_id).toBe(one.thread_id)
-    expect(two.text).toBe(`Tool result (call_id=${call.id}, name=read_file): # Title`)
+    expect(two.text).toBe(`Tool result (call_id=${call.id}, name=read_file): # Title\n\n${_internal.toolbridge.TOOL_REMINDER}`)
     // the thread keeps its instructions: they are not sent again
     expect(two.custom_prompt).toBeNull()
 
     // changed instructions are sent again, to the same thread
     await post({ model: "smart", tools, messages: [{ role: "system", content: "Now be terse." }, ...messages.slice(1), { role: "assistant", content: "ok" }, { role: "user", content: "more" }] }, { headers })
     const three = mock.state.turns.at(-1)
-    expect(three).toMatchObject({ thread_id: one.thread_id, text: "more" })
+    expect(three).toMatchObject({ thread_id: one.thread_id, text: `more\n\n${_internal.toolbridge.TOOL_REMINDER}` })
     expect(three.custom_prompt).toStartWith("Now be terse.")
   })
 

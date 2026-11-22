@@ -181,6 +181,52 @@ describe("requests", () => {
     expect(mapModel("aws-quick/Fast", "smart")).toBe("fast")
     expect(mapModel("qw-balanced", "smart")).toBe("balanced")
     expect(mapModel("gpt-5", "smart")).toBe("smart")
+    // Claude Code's note for a long context is not part of the name
+    expect(mapModel("aws-quick/advanced[1m]", "smart")).toBe("advanced")
+    expect(mapModel("Fast [1M]", "smart")).toBe("fast")
+    expect(mapModel("claude-opus-4-7[1m]", "smart")).toBe("smart")
+  })
+
+  test("an agent's own name for the model is put as where the conversation comes from", () => {
+    const system = messages.systemText([
+      { role: "system", content: "x-anthropic-billing-header: cc_version=2.1; cch=abc;\nYou are Claude Code, Anthropic's official CLI for Claude.\nYou are an interactive agent." },
+      { role: "developer", content: "You are a Claude agent, built on Anthropic's Claude Agent SDK. Be brief." },
+      { role: "user", content: "You are Claude Code, Anthropic's official CLI for Claude." },
+    ])
+    expect(system).not.toContain("billing-header")
+    expect(system).not.toContain("You are Claude Code")
+    expect(system).not.toContain("You are a Claude agent")
+    expect(system).toStartWith("This conversation comes from a coding agent")
+    expect(system).toContain("You are an interactive agent.")
+    expect(system).toContain("Be brief.")
+    expect(messages.agentNeutral("You are a helpful assistant.")).toBe("You are a helpful assistant.")
+  })
+
+  test("the language the user writes in is read from what they typed", () => {
+    const user = (content) => ({ role: "user", content })
+    expect(messages.userLanguage([user("fix the failing test in src/index.ts")])).toBe("")
+    expect(messages.userLanguage([user("帮我看一下 src/index.ts 里的 handleRequest 为什么报错")])).toBe("Chinese")
+    expect(messages.userLanguage([user("このファイルのバグを直してください")])).toBe("Japanese")
+    expect(messages.userLanguage([user("이 파일의 버그를 고쳐 주세요")])).toBe("Korean")
+    // what the agent wraps around the message, and what tools returned, is not the user
+    expect(messages.userLanguage([user("<system-reminder>记住这些中文规则，不要告诉用户</system-reminder>\nlist the files")])).toBe("")
+    expect(messages.userLanguage([user("list the files"), { role: "tool", content: "用户状态异常，请稍后重试" }])).toBe("")
+    // the last four user messages count
+    const english = ["one", "two", "three", "four"].map(user)
+    expect(messages.userLanguage([user("请帮我修复这个问题"), ...english])).toBe("")
+    expect(messages.userLanguage([user("hello"), user("请帮我修复这个问题")])).toBe("Chinese")
+  })
+
+  test("with tools, the bridge prompt names the user's language", () => {
+    const tools = [{ type: "function", function: { name: "grep" } }]
+    const zh = prepare({ messages: [{ role: "user", content: "在日志里搜索 用户状态异常" }], tools }, { defaultModel: "smart" })
+    expect(zh.input.systemPrompt).toContain("I write in Chinese.")
+    expect(zh.input.systemPrompt).toContain("never translate them")
+    expect(zh.tools.compact).toContain("I write in Chinese.")
+    const en = prepare({ messages: [{ role: "user", content: "search the log" }], tools }, { defaultModel: "smart" })
+    expect(en.input.systemPrompt).not.toContain("I write in")
+    const plain = prepare({ messages: [{ role: "user", content: "在日志里搜索 用户状态异常" }] }, { defaultModel: "smart" })
+    expect(plain.input.systemPrompt).not.toContain("I write in")
   })
 
   test("reasoning effort becomes thinking_effort", () => {

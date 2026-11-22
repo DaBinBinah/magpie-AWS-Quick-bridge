@@ -124,7 +124,7 @@ describe("Anthropic Messages (Claude Code)", () => {
     const res = await call("/v1/messages?beta=true", {
       model: "claude-haiku-4-5",
       max_tokens: 100,
-      system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=1; cch=abc;" }, { type: "text", text: "You are a coding agent.", cache_control: { type: "ephemeral" } }],
+      system: [{ type: "text", text: "x-anthropic-billing-header: cc_version=1; cch=abc;" }, { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." }, { type: "text", text: "You are a coding agent.", cache_control: { type: "ephemeral" } }],
       messages: [{ role: "user", content: [{ type: "text", text: "ping" }] }, { role: "system", content: [{ type: "text", text: "Today is Sunday." }] }],
     })
     const body = await res.json()
@@ -141,6 +141,8 @@ describe("Anthropic Messages (Claude Code)", () => {
     expect(turn.custom_prompt).toContain("You are a coding agent.")
     expect(turn.custom_prompt).toContain("Today is Sunday.")
     expect(turn.custom_prompt).not.toContain("x-anthropic-billing-header")
+    expect(turn.custom_prompt).not.toContain("You are Claude Code")
+    expect(turn.custom_prompt).toContain("This conversation comes from a coding agent")
   })
 
   test("a streamed tool call, and its result on the next request", async () => {

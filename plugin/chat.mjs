@@ -3,10 +3,10 @@
 // are magpie's, so a request is tried once and a failure is answered with a
 // status magpie can act on.
 
-import { UPSTREAM_PROMPT_OVERRIDE, isSystemMessage, lastUserText, promptBlocks, systemText, titleFor, uuid } from "./messages.mjs"
+import { UPSTREAM_PROMPT_OVERRIDE, isSystemMessage, languageNote, lastUserText, promptBlocks, systemText, titleFor, uuid } from "./messages.mjs"
 import * as qbs from "./qbs.mjs"
 import { ThreadStore, digest, messageKey } from "./threads.mjs"
-import { BridgeStream, buildToolBridgePrompt, parseClientToolCalls, parseToolChoice, requestedToolNames } from "./toolbridge.mjs"
+import { BridgeStream, TOOL_REMINDER, buildToolBridgePrompt, parseClientToolCalls, parseToolChoice, requestedToolNames } from "./toolbridge.mjs"
 import { UpstreamError, chat, encodeFrame, sessionFromAuth, userMessage } from "./upstream.mjs"
 import { isGatewayProvider } from "./wire.mjs"
 
@@ -14,8 +14,10 @@ import { isGatewayProvider } from "./wire.mjs"
 export const MODES = ["smart", "fast", "balanced", "auto"]
 const AGENT_MODES = [...MODES, "advanced"]
 
+// A name may carry a bracketed note that is the agent's own, as Claude
+// Code's "[1m]" for a long context: it is not part of the mode.
 export function mapModel(model, fallback) {
-  let m = String(model ?? "").trim().toLowerCase()
+  let m = String(model ?? "").replace(/\[[^\]]*\]/g, "").trim().toLowerCase()
   m = m.slice(m.lastIndexOf("/") + 1)
   if (m.startsWith("qw-")) m = m.slice(3)
   return AGENT_MODES.includes(m) ? m : fallback
@@ -87,7 +89,13 @@ export function prepare(body, cfg, threadId) {
   const choice = parseToolChoice(body.tool_choice ?? body.function_call)
   if (choice.mode === "function" && choice.name) allowed.add(choice.name)
   const parallel = body.parallel_tool_calls !== false
-  const tools = (compact) => buildToolBridgePrompt(body.tools, body.functions, choice.mode, choice.name, parallel, compact)
+  // with tools, the language the user writes in is named: the tools' arguments
+  // are then the user's own words, not a translation of them
+  const language = languageNote(convo)
+  const tools = (compact) => {
+    const prompt = buildToolBridgePrompt(body.tools, body.functions, choice.mode, choice.name, parallel, compact)
+    return prompt && language ? prompt + "\n\n" + language : prompt
+  }
   const bridgePrompt = tools(false)
   const system = systemText(messages)
   const custom = (toolsPrompt) => [system, UPSTREAM_PROMPT_OVERRIDE, toolsPrompt].filter(Boolean).join("\n\n")
@@ -111,6 +119,7 @@ export function prepare(body, cfg, threadId) {
       threadId,
       title: titleFor(lastUserText(messages)),
       systemPrompt: custom(bridgePrompt),
+      reminder: bridgePrompt ? TOOL_REMINDER : "",
       thinkingEffort: thinkingEffort(body, cfg.thinkingEffort),
       webSearch: typeof body.web_search_enabled === "boolean" ? body.web_search_enabled : cfg.webSearch === true,
     },
