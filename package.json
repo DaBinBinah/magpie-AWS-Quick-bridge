@@ -1,6 +1,6 @@
 {
   "name": "magpie-aws-quick-bridge",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Amazon Quick (QuickWork) for Claude Code, Codex and OpenCode. Works with both Magpie (provider plugin) and CC Switch (local API). 同时支持 Magpie 与 CC Switch。",
   "type": "module",
   "main": "./opencode.mjs",
@@ -34,7 +34,15 @@
     "provider",
     "aws",
     "amazon-quick",
-    "quickwork"
+    "quickwork",
+    "magpie-AWS-Quick-bridge",
+    "aws-quick",
+    "amazon",
+    "quick",
+    "ccswitch",
+    "auth",
+    "proxy",
+    "gateway"
   ],
   "license": "GPL-3.0-only",
   "author": {
