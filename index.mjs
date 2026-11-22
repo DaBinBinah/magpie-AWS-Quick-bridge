@@ -7,6 +7,7 @@ import { browserSignIn } from "./plugin/login.mjs"
 import * as messages from "./plugin/messages.mjs"
 import * as oauth from "./plugin/oauth.mjs"
 import * as qbs from "./plugin/qbs.mjs"
+import { accountModels, durationMs, models, settings } from "./plugin/settings.mjs"
 import * as threads from "./plugin/threads.mjs"
 import * as toolbridge from "./plugin/toolbridge.mjs"
 import * as upstream from "./plugin/upstream.mjs"
@@ -19,79 +20,6 @@ const KEEP_SESSIONS = "keep_sessions"
 const REFRESH_LEAD_MS = 10 * 60_000
 // magpie's id for the conversation a request belongs to (chat.headers)
 const CONVERSATION = "x-aws-quick-conversation"
-
-const MODEL_NAMES = { smart: "Quick Smart", fast: "Quick Fast", balanced: "Quick Balanced", auto: "Quick Auto", advanced: "Quick Advanced" }
-
-// "30s", "5m", "1h" or a number of seconds.
-function durationMs(value, fallback) {
-  if (typeof value === "number" && value > 0) return value * 1000
-  const m = /^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h)?\s*$/.exec(String(value ?? ""))
-  if (!m || !(Number(m[1]) > 0)) return fallback
-  return Number(m[1]) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[m[2] ?? "s"]
-}
-
-const text = (value, fallback = "") => (typeof value === "string" && value.trim() ? value.trim() : fallback)
-
-// The plugin's options (plugins.json).
-function settings(options = {}) {
-  // 0 takes any free port
-  const port = typeof options.callback_port === "number" ? options.callback_port : Number(options.callback_port || NaN)
-  const effort = text(options.thinking_effort).toLowerCase()
-  return {
-    appVersion: text(options.app_version, "1.2.4660"),
-    surface: text(options.surface, "QUICK_WORK_DESKTOP_WINDOWS"),
-    outpostId: text(options.outpost_id),
-    workingSessionId: text(options.working_session_id),
-    timezone: text(options.timezone, "UTC"),
-    locale: text(options.locale, "en-US"),
-    thinkingEffort: ["off", "low", "medium", "high"].includes(effort) ? effort : "",
-    keepSessions: options.keep_sessions === true,
-    webSearch: options.web_search === true,
-    // false: every request starts a new thread and sends the whole conversation
-    stateful: options.stateful !== false,
-    attachments: options.attachments !== false,
-    // what a frame may weigh; Amazon Quick's limit is 64 KB (65536). 0 sends any size
-    maxFrameBytes: Number.isInteger(options.max_frame_bytes) && options.max_frame_bytes >= 0 ? options.max_frame_bytes : 60_000,
-    defaultModel: mapModel(options.default_model, "smart"),
-    requestTimeoutMs: durationMs(options.request_timeout, 5 * 60_000),
-    proxy: text(options.proxy),
-    provider: oauth.normalizedProvider(options.provider),
-    stage: oauth.normalizedStage(options.build_stage),
-    region: text(options.region),
-    callbackPort: Number.isInteger(port) && port >= 0 && port < 65536 ? port : 18080,
-    loginTimeoutMs: durationMs(options.login_timeout, 30 * 60_000),
-  }
-}
-
-// The context window is what Amazon Quick reports with each turn's usage;
-// the output limits are estimates, it publishes none.
-const model = (id) => ({
-  name: MODEL_NAMES[id] ?? `Quick ${id}`,
-  limit: { context: 1_000_000, output: id === "fast" ? 32_000 : 64_000 },
-  tool_call: true,
-  reasoning: true,
-  attachment: true,
-  variants: { low: {}, medium: {}, high: {} },
-  modalities: { input: ["text", "image"], output: ["text"] },
-})
-
-const models = () => Object.fromEntries(MODES.map((id) => [id, model(id)]))
-
-// The account's own list: its settings name the modes it may not use and
-// say whether it has the advanced one.
-function accountModels(listed, account) {
-  const out = { ...listed }
-  const slots = account?.model_slots
-  const entries = Array.isArray(slots) ? slots.map((s) => [s?.id, s]) : Object.entries(slots && typeof slots === "object" ? slots : {})
-  let advanced = account?.advanced_mode_enabled === true
-  for (const [id, slot] of entries) {
-    if (typeof id !== "string" || !slot || typeof slot !== "object") continue
-    if (slot.enabled === false) delete out[id]
-    else if (id === "advanced") advanced = true
-  }
-  if (advanced && !out.advanced) out.advanced = { ...(listed.smart ?? {}), ...model("advanced"), id: "advanced" }
-  return out
-}
 
 const ACCOUNT_TYPE = {
   type: "select",

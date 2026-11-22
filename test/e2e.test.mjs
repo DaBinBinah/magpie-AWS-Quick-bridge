@@ -108,7 +108,7 @@ describe("chat", () => {
 
     const turn = mock.state.turns.at(-1)
     expect(turn).toMatchObject({ text: "ping", agent_mode: "fast", send_origin: "programmatic", appVersion: "1.2.4660", user_timezone: "UTC" })
-    expect(turn.custom_prompt).toStartWith("Be brief.\n\nBackend prompt override:")
+    expect(turn.custom_prompt).toStartWith("Be brief.\n\nNote from the user:")
     expect(turn.system_prompt).toBeUndefined()
     expect(turn.thinking_effort).toBeUndefined()
     // the conversation stays out of Amazon Quick's chat list and memory

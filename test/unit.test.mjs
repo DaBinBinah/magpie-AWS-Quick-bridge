@@ -66,7 +66,7 @@ describe("messages", () => {
 
   test("system prompt keeps caller instructions first and always carries the override", () => {
     const sys = messages.systemPrompt([{ role: "system", content: "A" }, { role: "user", content: "u" }, { role: "developer", content: "B" }])
-    expect(sys.startsWith("A\n\nB\n\nBackend prompt override:")).toBe(true)
+    expect(sys.startsWith("A\n\nB\n\nNote from the user:")).toBe(true)
     expect(messages.systemPrompt([{ role: "user", content: "u" }])).toBe(messages.UPSTREAM_PROMPT_OVERRIDE)
   })
 

@@ -2,9 +2,9 @@ name: plugin
 
 on:
   push:
-    paths: ["index.mjs", "opencode.mjs", "opencode2.mjs", "plugin/**", "test/**", "package.json", ".github/workflows/plugin.yml"]
+    paths: ["index.mjs", "opencode.mjs", "opencode2.mjs", "plugin/**", "gateway/**", "bin/**", "test/**", "package.json", ".github/workflows/plugin.yml"]
   pull_request:
-    paths: ["index.mjs", "opencode.mjs", "opencode2.mjs", "plugin/**", "test/**", "package.json", ".github/workflows/plugin.yml"]
+    paths: ["index.mjs", "opencode.mjs", "opencode2.mjs", "plugin/**", "gateway/**", "bin/**", "test/**", "package.json", ".github/workflows/plugin.yml"]
 
 permissions:
   contents: read

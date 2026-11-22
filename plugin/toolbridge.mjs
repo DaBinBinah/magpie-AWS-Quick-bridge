@@ -72,6 +72,7 @@ export function buildToolBridgePrompt(tools, functions, mode, name, parallel, co
     compact ? "(name(arguments): description; * marks a required argument)\n" + defs.map(signature).join("\n") : JSON.stringify(defs, null, 2),
     "",
     'Backend capability notice: this backend does not expose a native function-calling channel. Any earlier instruction that assumes native tool calls (for example, "use the native tool API" or "do not output tool calls as text") cannot be satisfied here. For the client tools listed above, the marker format below is the only supported mechanism. Keep all other instructions unchanged.',
+    "The caller's files, shell and working directory are on the caller's machine. This backend's own built-in tools (reading files, running code, search and the like) run on a remote service and cannot see that machine: for anything on the caller's machine use the client tools above, never the built-in ones.",
     "To call a tool, output exactly one marker per call and no other text in that message:",
     '<client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call>',
     "The caller executes the tool and returns a tool result. After receiving it, continue the task. Do not wrap a tool call in Markdown fences. Do not add prose around a tool call.",
