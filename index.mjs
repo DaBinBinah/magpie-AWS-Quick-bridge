@@ -2,10 +2,12 @@
 // and OpenCode. It signs in with Amazon Quick's own desktop OAuth flow and
 // answers chat completions over Amazon Quick's chat WebSocket.
 
-import { MODES, chatCompletions, errorResponse, failureResponse, mapModel, prepare, thinkingEffort, usageBody } from "./plugin/chat.mjs"
+import { MODES, chatCompletions, compose, errorResponse, failureResponse, mapModel, prepare, thinkingEffort, usageBody } from "./plugin/chat.mjs"
 import { browserSignIn } from "./plugin/login.mjs"
 import * as messages from "./plugin/messages.mjs"
 import * as oauth from "./plugin/oauth.mjs"
+import * as qbs from "./plugin/qbs.mjs"
+import * as threads from "./plugin/threads.mjs"
 import * as toolbridge from "./plugin/toolbridge.mjs"
 import * as upstream from "./plugin/upstream.mjs"
 import * as wire from "./plugin/wire.mjs"
@@ -15,8 +17,10 @@ const ID = "aws-quick"
 const BASE = "https://aws-quick.invalid/v1"
 const KEEP_SESSIONS = "keep_sessions"
 const REFRESH_LEAD_MS = 10 * 60_000
+// magpie's id for the conversation a request belongs to (chat.headers)
+const CONVERSATION = "x-aws-quick-conversation"
 
-const MODEL_NAMES = { smart: "Quick Smart", fast: "Quick Fast", balanced: "Quick Balanced", auto: "Quick Auto" }
+const MODEL_NAMES = { smart: "Quick Smart", fast: "Quick Fast", balanced: "Quick Balanced", auto: "Quick Auto", advanced: "Quick Advanced" }
 
 // "30s", "5m", "1h" or a number of seconds.
 function durationMs(value, fallback) {
@@ -42,6 +46,12 @@ function settings(options = {}) {
     locale: text(options.locale, "en-US"),
     thinkingEffort: ["off", "low", "medium", "high"].includes(effort) ? effort : "",
     keepSessions: options.keep_sessions === true,
+    webSearch: options.web_search === true,
+    // false: every request starts a new thread and sends the whole conversation
+    stateful: options.stateful !== false,
+    attachments: options.attachments !== false,
+    // what a frame may weigh; Amazon Quick's limit is 64 KB (65536). 0 sends any size
+    maxFrameBytes: Number.isInteger(options.max_frame_bytes) && options.max_frame_bytes >= 0 ? options.max_frame_bytes : 60_000,
     defaultModel: mapModel(options.default_model, "smart"),
     requestTimeoutMs: durationMs(options.request_timeout, 5 * 60_000),
     proxy: text(options.proxy),
@@ -53,20 +63,35 @@ function settings(options = {}) {
   }
 }
 
-const models = () =>
-  Object.fromEntries(
-    MODES.map((id) => [
-      id,
-      {
-        name: MODEL_NAMES[id],
-        limit: { context: 200000, output: 32000 },
-        tool_call: true,
-        reasoning: true,
-        variants: { low: {}, medium: {}, high: {} },
-        modalities: { input: ["text"], output: ["text"] },
-      },
-    ]),
-  )
+// The context window is what Amazon Quick reports with each turn's usage;
+// the output limits are estimates, it publishes none.
+const model = (id) => ({
+  name: MODEL_NAMES[id] ?? `Quick ${id}`,
+  limit: { context: 1_000_000, output: id === "fast" ? 32_000 : 64_000 },
+  tool_call: true,
+  reasoning: true,
+  attachment: true,
+  variants: { low: {}, medium: {}, high: {} },
+  modalities: { input: ["text", "image"], output: ["text"] },
+})
+
+const models = () => Object.fromEntries(MODES.map((id) => [id, model(id)]))
+
+// The account's own list: its settings name the modes it may not use and
+// say whether it has the advanced one.
+function accountModels(listed, account) {
+  const out = { ...listed }
+  const slots = account?.model_slots
+  const entries = Array.isArray(slots) ? slots.map((s) => [s?.id, s]) : Object.entries(slots && typeof slots === "object" ? slots : {})
+  let advanced = account?.advanced_mode_enabled === true
+  for (const [id, slot] of entries) {
+    if (typeof id !== "string" || !slot || typeof slot !== "object") continue
+    if (slot.enabled === false) delete out[id]
+    else if (id === "advanced") advanced = true
+  }
+  if (advanced && !out.advanced) out.advanced = { ...(listed.smart ?? {}), ...model("advanced"), id: "advanced" }
+  return out
+}
 
 const ACCOUNT_TYPE = {
   type: "select",
@@ -127,6 +152,22 @@ const server = async (input, options) => {
   }
 
   return {
+    "chat.headers": async (hook, output) => {
+      if ((hook?.model?.providerID ?? hook?.provider?.info?.id) === ID && hook?.sessionID) output.headers[CONVERSATION] = String(hook.sessionID).slice(0, 128)
+    },
+    provider: {
+      id: ID,
+      // magpie asks for each account; a failure leaves the list as it was
+      async models(provider, { auth } = {}) {
+        const listed = provider?.models ?? {}
+        if (auth?.type !== "oauth" || !auth.access) return listed
+        try {
+          return accountModels(listed, await qbs.settings(auth))
+        } catch {
+          return listed
+        }
+      },
+    },
     config: async (config) => {
       config.provider ??= {}
       const was = config.provider[ID] ?? {}
@@ -144,12 +185,12 @@ const server = async (input, options) => {
       options: [
         {
           key: KEEP_SESSIONS,
-          label: "Keep Amazon Quick sessions",
-          description: "Leaves the conversation each request creates in Amazon Quick's own chat list instead of deleting it when the reply ends.",
-          labels: { zh: "保留 Amazon Quick 会话", "zh-TW": "保留 Amazon Quick 對話" },
+          label: "Show conversations in Amazon Quick",
+          description: "Conversations are incognito by default: they stay out of Amazon Quick's chat list and its memory. Turn this on to have them listed there, where Amazon Quick may also save things from them to its memory.",
+          labels: { zh: "在 Amazon Quick 里显示对话", "zh-TW": "在 Amazon Quick 裡顯示對話" },
           descriptions: {
-            zh: "每个请求在 Amazon Quick 里创建的会话，回复结束后不再删除，会留在 Amazon Quick 自己的聊天列表里。",
-            "zh-TW": "每個請求在 Amazon Quick 裡建立的對話，回覆結束後不再刪除，會留在 Amazon Quick 自己的聊天列表裡。",
+            zh: "对话默认是隐身的：不出现在 Amazon Quick 的聊天列表里，也不写入它的记忆。打开后对话会列在那里，Amazon Quick 也可能把其中的内容存进它的记忆。",
+            "zh-TW": "對話預設是隱身的：不出現在 Amazon Quick 的聊天列表裡，也不寫入它的記憶。開啟後對話會列在那裡，Amazon Quick 也可能把其中的內容存進它的記憶。",
           },
         },
       ],
@@ -162,6 +203,17 @@ const server = async (input, options) => {
           authorize: (inputs, ctx) => browserSignIn(inputs, cfg(), ctx),
         },
       ],
+      // magpie's hook: how much of the plan is used. A refusal here never
+      // marks the account: only a chat request does.
+      async usage(getAuth) {
+        const auth = await getAuth()
+        if (auth?.type !== "oauth" || !auth.access) return { error: "not signed in", windows: [], signIn: "kept" }
+        try {
+          return { ...(await qbs.usage(auth)), signIn: "kept" }
+        } catch (e) {
+          return { error: String(e?.message ?? e), windows: [], signIn: "kept" }
+        }
+      },
       // magpie's hook: renews the account's tokens before they expire
       async refresh(auth) {
         if (auth?.type !== "oauth") return
@@ -204,7 +256,7 @@ const server = async (input, options) => {
               auth,
               cfg: cfg(),
               signal: init?.signal ?? (request instanceof Request ? request.signal : undefined),
-              threadId: headers.get("x-thread-id") ?? "",
+              conversation: headers.get(CONVERSATION) ?? headers.get("x-thread-id") ?? "",
             })
           },
         }
@@ -216,4 +268,4 @@ const server = async (input, options) => {
 export default { id: "magpie-aws-quick-bridge", server }
 
 // for tests
-export const _internal = { settings, durationMs, models, prepare, mapModel, thinkingEffort, usageBody, failureResponse, chatCompletions, messages, oauth, toolbridge, upstream, wire }
+export const _internal = { settings, durationMs, models, prepare, compose, mapModel, thinkingEffort, usageBody, failureResponse, chatCompletions, accountModels, threads, messages, oauth, qbs, toolbridge, upstream, wire }

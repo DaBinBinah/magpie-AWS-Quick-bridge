@@ -108,11 +108,11 @@ describe("chat", () => {
 
     const turn = mock.state.turns.at(-1)
     expect(turn).toMatchObject({ text: "ping", agent_mode: "fast", send_origin: "programmatic", appVersion: "1.2.4660", user_timezone: "UTC" })
-    expect(turn.system_prompt).toStartWith("Be brief.\n\nBackend prompt override:")
+    expect(turn.custom_prompt).toStartWith("Be brief.\n\nBackend prompt override:")
+    expect(turn.system_prompt).toBeUndefined()
     expect(turn.thinking_effort).toBeUndefined()
-    // the conversation is taken out of Amazon Quick's chat list again
-    await Bun.sleep(50)
-    expect(mock.state.deleted).toContain(turn.thread_id)
+    // the conversation stays out of Amazon Quick's chat list and memory
+    expect(turn).toMatchObject({ incognito: true, auto_routing: false, web_search_enabled: false })
   })
 
   test("a streamed completion", async () => {
@@ -135,7 +135,7 @@ describe("chat", () => {
     expect(call).toMatchObject({ index: 0, type: "function", function: { name: "get_weather", arguments: '{"city":"Paris"}' } })
     expect(call.id).toStartWith("call_")
     expect(events.at(-1).choices[0].finish_reason).toBe("tool_calls")
-    expect(mock.state.turns.at(-1).system_prompt).toContain('"name": "get_weather"')
+    expect(mock.state.turns.at(-1).custom_prompt).toContain('"name": "get_weather"')
   })
 
   test("a client tool call, not streamed, and its result on the next turn", async () => {
@@ -161,7 +161,7 @@ describe("chat", () => {
   test("tool_choice none turns the bridge off", async () => {
     const body = await (await post({ model: "smart", tools, tool_choice: "none", messages: [{ role: "user", content: "Please use the tool get_weather" }] })).json()
     expect(body.choices[0].message).toEqual({ role: "assistant", content: "pong from smart" })
-    expect(mock.state.turns.at(-1).system_prompt).not.toContain("<client_tool_protocol>")
+    expect(mock.state.turns.at(-1).custom_prompt).not.toContain("<client_tool_protocol>")
   })
 
   test("an error event before any text is a status magpie can act on", async () => {
@@ -184,6 +184,29 @@ describe("chat", () => {
     expect((await (await send(`${baseURL}/models`, { method: "GET" })).json()).data.map((m) => m.id)).toEqual(["smart", "fast", "balanced", "auto"])
   })
 
+  test("auto is the smart mode with Amazon Quick's routing", async () => {
+    await post({ model: "auto", messages: [{ role: "user", content: "ping" }] })
+    expect(mock.state.turns.at(-1)).toMatchObject({ agent_mode: "smart", auto_routing: true })
+  })
+
+  test("thinking comes back as reasoning_content, a long event in pieces is put together", async () => {
+    const long = JSON.stringify({ type: "text_delta", payload: { delta: "x".repeat(300) } })
+    mock.state.script = () => [
+      { type: "thinking_delta", payload: { delta: "hmm" } },
+      { type: "_chunked_frame", payload: { chunk_id: "c1", chunk_index: 1, total_chunks: 2, data: long.slice(100) } },
+      { type: "_chunked_frame", payload: { chunk_id: "c1", chunk_index: 0, total_chunks: 2, data: long.slice(0, 100) } },
+      { type: "message_complete", payload: {} },
+      { type: "turn_completed", payload: {} },
+    ]
+    const body = await (await post({ model: "smart", messages: [{ role: "user", content: "think" }] })).json()
+    expect(body.choices[0].message).toEqual({ role: "assistant", content: "x".repeat(300), reasoning_content: "hmm" })
+    const events = await sse(await post({ model: "smart", stream: true, messages: [{ role: "user", content: "think again" }] }))
+    expect(events.map((e) => e.choices[0].delta.reasoning_content ?? "").join("")).toBe("hmm")
+    mock.state.script = () => [{ type: "guardrail_blocked", payload: { message: "blocked by policy" } }]
+    expect((await post({ model: "smart", messages: [{ role: "user", content: "bad" }] })).status).toBe(400)
+    mock.state.script = null
+  })
+
   test("a cancelled request ends the upstream turn", async () => {
     mock.state.script = () => []
     const abort = new AbortController()
@@ -192,6 +215,105 @@ describe("chat", () => {
     await expect(pending).rejects.toThrow()
     await pending.catch(() => {})
     mock.state.script = null
+  })
+})
+
+describe("a conversation over several requests", () => {
+  const tools = [{ type: "function", function: { name: "read_file", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } }]
+  const system = { role: "system", content: "You are a coding agent." }
+  const ask = { role: "user", content: "Please use the tool read_file" }
+  const headers = { "x-aws-quick-conversation": "s1" }
+
+  test("the next request goes to the same thread with only what is new", async () => {
+    const first = await (await post({ model: "smart", tools, messages: [system, ask] }, { headers })).json()
+    const call = first.choices[0].message.tool_calls[0]
+    const one = mock.state.turns.at(-1)
+    expect(one.custom_prompt).toContain("<client_tool_protocol>")
+
+    const messages = [system, ask, first.choices[0].message, { role: "tool", tool_call_id: call.id, content: "# Title" }]
+    await post({ model: "smart", tools, messages }, { headers })
+    const two = mock.state.turns.at(-1)
+    expect(two.thread_id).toBe(one.thread_id)
+    expect(two.text).toBe(`Tool result (call_id=${call.id}, name=read_file): # Title`)
+    // the thread keeps its instructions: they are not sent again
+    expect(two.custom_prompt).toBeNull()
+
+    // changed instructions are sent again, to the same thread
+    await post({ model: "smart", tools, messages: [{ role: "system", content: "Now be terse." }, ...messages.slice(1), { role: "assistant", content: "ok" }, { role: "user", content: "more" }] }, { headers })
+    const three = mock.state.turns.at(-1)
+    expect(three).toMatchObject({ thread_id: one.thread_id, text: "more" })
+    expect(three.custom_prompt).toStartWith("Now be terse.")
+  })
+
+  test("another conversation, or an edited history, starts a new thread", async () => {
+    const before = mock.state.turns.at(-1).thread_id
+    await post({ model: "smart", messages: [system, ask, { role: "assistant", content: "x" }, { role: "user", content: "more" }] }, { headers: { "x-aws-quick-conversation": "s2" } })
+    expect(mock.state.turns.at(-1).thread_id).not.toBe(before)
+    await post({ model: "smart", messages: [system, { role: "user", content: "something else" }, { role: "assistant", content: "x" }, { role: "user", content: "more" }] }, { headers })
+    const turn = mock.state.turns.at(-1)
+    expect(turn.thread_id).not.toBe(before)
+    expect(turn.text).toBe("User: something else\n\nAssistant: x\n\nUser: more")
+  })
+
+  test("what does not fit a 64 KB frame: schemas become signatures, long text an attachment", async () => {
+    const big = Array.from({ length: 40 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, description: "d".repeat(900), parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } }))
+    await post({ model: "smart", tools: big, messages: [system, { role: "user", content: "hello" }] })
+    let turn = mock.state.turns.at(-1)
+    expect(turn.custom_prompt).toContain("- tool_0(path*: string): ddd")
+    expect(turn.custom_prompt).not.toContain('"parameters"')
+
+    const log = "line\n".repeat(30000)
+    const res = await post({ model: "smart", messages: [{ role: "user", content: "first" }, { role: "assistant", content: "ok" }, { role: "user", content: log }, { role: "assistant", content: "seen" }, { role: "user", content: "and now?" }] })
+    expect(res.status).toBe(200)
+    turn = mock.state.turns.at(-1)
+    const upload = mock.state.uploads.at(-1)
+    expect(upload).toMatchObject({ contentType: "text/plain", thread: turn.thread_id })
+    expect(upload.text).toStartWith("User: first\n\nAssistant: ok\n\nUser: line\n")
+    expect(turn.text).toContain(`attached file ${upload.name}`)
+    expect(turn.text).toEndWith("User: and now?")
+    expect(turn.attachments).toEqual([{ type: "file", name: upload.name, size: upload.size, mimeType: "text/plain", path: `/data/workspace/attached_files/${upload.name}`, attachmentId: upload.id, contentSha256: expect.any(String) }])
+  })
+
+  test("an inline image is sent as an attachment", async () => {
+    const png = Buffer.from("89504e470d0a1a0a", "hex").toString("base64")
+    await post({ model: "smart", messages: [{ role: "user", content: [{ type: "text", text: "what is this? " }, { type: "image_url", image_url: { url: `data:image/png;base64,${png}` } }] }] })
+    const turn = mock.state.turns.at(-1)
+    expect(turn.text).toBe("what is this? [image: attached file image_1.png]")
+    expect(turn.attachments[0]).toMatchObject({ type: "image", name: "image_1.png", mimeType: "image/png", size: 8 })
+  })
+})
+
+describe("the account", () => {
+  test("usage for magpie quota", async () => {
+    expect(await hooks.auth.usage(async () => auth)).toEqual({
+      plan: "Free Trial",
+      user: "ada@example.com",
+      until: "2026-12-19T13:53:55.000Z",
+      windows: [
+        { name: "Monthly", amount: 17, limit: 600, unit: "credits", display: "17 / 600 credits", resetsAt: "2026-12-01T00:00:00.000Z" },
+        { name: "Session", amount: 3, limit: 100, unit: "credits", display: "3 / 100 credits" },
+      ],
+      signIn: "kept",
+    })
+    // a refusal is reported, and never marks the account
+    expect(await hooks.auth.usage(async () => ({ ...auth, access: "wrong" }))).toMatchObject({ error: expect.stringContaining("401"), signIn: "kept" })
+  })
+
+  test("the model list follows the account's settings", async () => {
+    const config = {}
+    await hooks.config(config)
+    const listed = config.provider["aws-quick"].models
+    expect(Object.keys(await hooks.provider.models({ models: listed }, { auth }))).toEqual(["smart", "fast", "balanced", "auto"])
+    const { accountModels } = _internal
+    expect(Object.keys(accountModels(listed, { advanced_mode_enabled: true, model_slots: { fast: { enabled: false } } }))).toEqual(["smart", "balanced", "auto", "advanced"])
+    expect(await hooks.provider.models({ models: listed }, { auth: { ...auth, accountId: "someone-else", access: "wrong" } })).toBe(listed)
+  })
+
+  test("magpie's conversation id travels in a header", async () => {
+    const output = { headers: {} }
+    await hooks["chat.headers"]({ model: { providerID: "aws-quick" }, sessionID: "ses_1" }, output)
+    await hooks["chat.headers"]({ model: { providerID: "openai" }, sessionID: "ses_2" }, output)
+    expect(output.headers).toEqual({ "x-aws-quick-conversation": "ses_1" })
   })
 })
 

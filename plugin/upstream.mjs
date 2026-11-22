@@ -1,5 +1,9 @@
 // One chat turn over the Amazon Quick bidi WebSocket, ported from
 // aws-quickwork-2api's internal/proxy/upstream.go.
+//
+// A turn names its thread. Amazon Quick keeps a thread's history and its
+// custom_prompt, so a later turn on another connection continues it by
+// naming the same thread_id.
 
 import { argumentString, callId, titleFor, uuid } from "./messages.mjs"
 import { GATEWAY_WS_PATH } from "./oauth.mjs"
@@ -16,13 +20,56 @@ const FAILURES = new Set(["error", "session_error", "stream_error", "turn_failed
 
 export class UpstreamError extends Error {
   // kind: "handshake" (status is the HTTP status the upgrade got, 0 when
-  // unknown), "upstream" (an error event), "timeout", "transport"
+  // unknown), "upstream" (an error event), "too_large" (the frame is over
+  // Amazon Quick's size limit), "blocked" (a guardrail), "timeout",
+  // "transport"
   constructor(kind, message, status = 0) {
     super(message)
     this.kind = kind
     this.status = status
   }
 }
+
+// What a user_message frame may weigh once encoded. Amazon Quick refuses
+// frames over 64 KB (FrameTooLarge).
+export const FRAME_LIMIT = 65_536
+
+// The user_message of a turn, shared with the code that fits a turn into a
+// frame.
+export function userMessage(session, cfg, input) {
+  const payload = {
+    text: input.prompt,
+    send_origin: "programmatic",
+    had_physical_input: false,
+    surfaceType: session.surface,
+    outpostId: session.outpostId,
+    appVersion: cfg.appVersion,
+    traceId: uuid(),
+    message_id: uuid(),
+    thread_id: input.threadId,
+    // "auto" is the smart mode with Amazon Quick's own routing on
+    agent_mode: input.model === "auto" ? "smart" : input.model,
+    user_timezone: cfg.timezone,
+    user_locale: cfg.locale,
+    chat_agent_id: null,
+    auto_routing: input.model === "auto",
+    web_search_enabled: input.webSearch === true,
+    pre_approved_tools: [],
+    preload_skills: [],
+    panel_edits: [],
+    // custom_prompt carries the caller's instructions and stays with the
+    // thread; null leaves the thread's as it is. Amazon Quick ignores a
+    // system_prompt field on this frame.
+    custom_prompt: String(input.systemPrompt ?? "").trim() ? input.systemPrompt : null,
+    // an incognito thread stays out of Amazon Quick's chat list and memory
+    incognito: !cfg.keepSessions,
+  }
+  if (input.thinkingEffort && input.thinkingEffort !== "off") payload.thinking_effort = input.thinkingEffort
+  if (input.attachments?.length) payload.attachments = input.attachments
+  return { type: "user_message", payload }
+}
+
+export const encodeFrame = (gateway, value) => (gateway ? gatewayEncode(JSON.stringify(value)) : aidpEncode(JSON.stringify(value)))
 
 // The account fields the transport needs, merged with handshake defaults.
 export function sessionFromAuth(auth, cfg) {
@@ -114,7 +161,7 @@ function rawText(value) {
 
 function errorText(env) {
   const p = env.payload && typeof env.payload === "object" ? env.payload : {}
-  for (const s of [p.message, p.error, env.error, p.code, env.error_code]) if (typeof s === "string" && s.trim()) return s
+  for (const s of [p.message, p.error, env.message, env.error, p.code, env.code, env.error_code]) if (typeof s === "string" && s.trim()) return s
   return "unknown upstream error"
 }
 
@@ -129,7 +176,8 @@ export function chat({ session, cfg, input, signal, onEvent }) {
   const title = String(input.title ?? "").trim() || titleFor(input.prompt)
 
   return new Promise((resolve, reject) => {
-    const usage = { prompt: 0, completion: 0, total: 0, cacheRead: 0, cacheWrite: 0 }
+    const usage = { prompt: 0, completion: 0, total: 0, cacheRead: 0, cacheWrite: 0, model: "" }
+    const chunks = new Map()
     const tools = new Map()
     const sent = new Set()
     const partialArgs = new Map()
@@ -153,10 +201,7 @@ export function chat({ session, cfg, input, signal, onEvent }) {
     }
     ws.binaryType = "arraybuffer"
 
-    const send = (value) => {
-      const json = JSON.stringify(value)
-      ws.send(gateway ? gatewayEncode(json) : aidpEncode(json))
-    }
+    const send = (value) => ws.send(encodeFrame(gateway, value))
 
     const cleanup = () => {
       for (const t of [idleTimer, completeTimer, handshakeTimer, requestTimer]) clearTimeout(t)
@@ -188,11 +233,6 @@ export function chat({ session, cfg, input, signal, onEvent }) {
       if (settled) return
       settled = true
       const res = result()
-      if (opened && !cfg.keepSessions) {
-        try {
-          send({ type: "session_delete", payload: { session_id: threadId } })
-        } catch {}
-      }
       cleanup()
       resolve(res)
     }
@@ -244,9 +284,38 @@ export function chat({ session, cfg, input, signal, onEvent }) {
     }
     const toolId = (p) => p.tool_id || p.tool_call_id || p.toolCallId
 
+    // A long event arrives as _chunked_frame pieces, in any order.
+    const chunked = (p) => {
+      const { chunk_id: id, chunk_index: index, total_chunks: total, data } = p
+      if (typeof id !== "string" || !id || typeof data !== "string") return
+      if (!Number.isInteger(index) || !Number.isInteger(total) || total < 1 || total > 4096 || index < 0 || index >= total) return
+      let entry = chunks.get(id)
+      if (!entry || entry.parts.length !== total) chunks.set(id, (entry = { parts: new Array(total).fill(null), have: 0 }))
+      if (entry.parts[index] === null) entry.have++
+      entry.parts[index] = data
+      if (entry.have < total) return
+      chunks.delete(id)
+      let env
+      try {
+        env = JSON.parse(entry.parts.join(""))
+      } catch {
+        return
+      }
+      if (env && typeof env === "object") handle(env)
+    }
+
     const handle = (env) => {
       const p = env.payload && typeof env.payload === "object" ? env.payload : {}
       switch (env.type) {
+        case "_chunked_frame":
+          return chunked(env.payload && typeof env.payload === "object" ? p : env)
+        case "thinking_delta": {
+          const delta = deltaText(env.payload)
+          if (delta) emit({ type: "reasoning", text: delta })
+          return
+        }
+        case "guardrail_blocked":
+          return fail(new UpstreamError("blocked", String(p.message || env.message || "Amazon Quick's guardrail blocked the reply")))
         case "text_delta": {
           const delta = deltaText(env.payload)
           if (!delta) return
@@ -266,6 +335,7 @@ export function chat({ session, cfg, input, signal, onEvent }) {
           usage.total += Number(p.total_tokens) || 0
           usage.cacheRead += Number(p.cache_read_tokens) || 0
           usage.cacheWrite += Number(p.cache_write_tokens) || 0
+          if (typeof p.resolved_model_id === "string") usage.model = p.resolved_model_id
           return
         case "tool_start": {
           const tc = getTool(toolId(p), p.tool_name)
@@ -326,7 +396,11 @@ export function chat({ session, cfg, input, signal, onEvent }) {
           completeTimer = p.continuation_expected ? null : setTimeout(succeed, AFTER_COMPLETE_MS)
           return
         default:
-          if (FAILURES.has(env.type)) return fail(new UpstreamError("upstream", `upstream ${env.type}: ${errorText(env)}`))
+          if (FAILURES.has(env.type)) {
+            const code = String(p.code ?? env.code ?? "")
+            if (code === "FrameTooLarge") return fail(new UpstreamError("too_large", errorText(env)))
+            return fail(new UpstreamError("upstream", `upstream ${env.type}: ${errorText(env)}`))
+          }
           if (TERMINAL.has(env.type)) succeed()
       }
     }
@@ -350,34 +424,10 @@ export function chat({ session, cfg, input, signal, onEvent }) {
             },
           })
         send({ type: "federate_status", payload: {} })
-        send({ type: "session_create", payload: { session_id: threadId, title } })
-
-        const payload = {
-          text: input.prompt,
-          send_origin: "programmatic",
-          had_physical_input: false,
-          surfaceType: session.surface,
-          outpostId: session.outpostId,
-          appVersion: cfg.appVersion,
-          traceId: uuid(),
-          message_id: uuid(),
-          thread_id: threadId,
-          agent_mode: input.model,
-          user_timezone: cfg.timezone,
-          user_locale: cfg.locale,
-          chat_agent_id: null,
-          auto_routing: false,
-          web_search_enabled: false,
-          pre_approved_tools: [],
-          preload_skills: [],
-          panel_edits: [],
-          custom_prompt: null,
-        }
-        // system_prompt is the native per-turn override; it carries the
-        // caller's instructions and the backend-prompt override notice.
-        if (String(input.systemPrompt ?? "").trim()) payload.system_prompt = input.systemPrompt
-        if (input.thinkingEffort && input.thinkingEffort !== "off") payload.thinking_effort = input.thinkingEffort
-        send({ type: "user_message", payload })
+        // A thread that shows in Amazon Quick's chat list is created with a
+        // title; an incognito one starts with its first message.
+        if (cfg.keepSessions && !input.resume) send({ type: "session_create", payload: { session_id: threadId, title } })
+        send(userMessage(session, cfg, { ...input, threadId }))
       } catch (e) {
         return fail(new UpstreamError("transport", `send user_message: ${e.message}`))
       }

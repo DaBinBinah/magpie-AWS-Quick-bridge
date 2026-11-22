@@ -1,5 +1,6 @@
 // A local stand-in for Amazon Quick: the discovery page, the IAM Identity
-// Center OIDC endpoints, user-info and the chat WebSocket (AIDP framing).
+// Center OIDC endpoints, user-info, the account API (usage, settings,
+// attachments) and the chat WebSocket (AIDP framing).
 // Used by the tests, and on its own to try the plugin in a magpie sandbox:
 //   bun test/mock-upstream.mjs 39100
 
@@ -14,7 +15,9 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
     codes: new Map(), // code -> code_challenge
     refreshes: 0,
     turns: [], // every user_message payload received
-    deleted: [],
+    custom: new Map(), // thread_id -> the custom_prompt it was last given
+    uploads: [], // { name, contentType, size, text, thread }
+    settings: { advanced_mode_enabled: false, model_slots: {} },
     rejectToken: "", // an id_token the WebSocket upgrade answers 401
     script: null, // (payload) => events[], overrides the default reply
   }
@@ -30,7 +33,7 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
     const usage = { type: "turn_usage", payload: { input_tokens: 12, output_tokens: 5, total_tokens: 20, cache_read_tokens: 3 } }
     const done = [usage, { type: "message_complete", payload: {} }, { type: "turn_completed", payload: {} }]
     const tool = /use the tool (\w+)/i.exec(payload.text)
-    if (tool && String(payload.system_prompt ?? "").includes("<client_tool_protocol>")) {
+    if (tool && String(state.custom.get(payload.thread_id) ?? "").includes("<client_tool_protocol>")) {
       const marker = `<client_tool_call>{"name":"${tool[1]}","arguments":{"city":"Paris"}}</client_tool_call>`
       // split inside the marker, as a real stream may
       return [
@@ -102,6 +105,34 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
         case "/integration/quick-work/user-info":
           if (!/^Bearer access-/.test(req.headers.get("authorization") ?? "")) return new Response("unauthorized", { status: 401 })
           return Response.json({ userInfo: { email, displayName: "Ada", awsAccountId: "123456789012", accountName: "mock" } })
+        case "/integration/quick-work/qbs-event": {
+          if (!/^Bearer access-/.test(req.headers.get("authorization") ?? "")) return new Response("unauthorized", { status: 401 })
+          const { path, body } = (await json()).eventBody?.invokeAgent ?? {}
+          const answer = (value) =>
+            Response.json({ eventType: "invokeAgent", eventResponse: { invokeAgentResponse: JSON.stringify({ type: "api_response", status: 200, body: value, body_encoding: "json" }) } })
+          if (path === "profile/usage")
+            return answer({
+              session: { used: 3, limit: 100, label: "Session usage", percent: 3, resume_in_minutes: 0 },
+              monthly: { used: 17, limit: 600, label: "Monthly usage", percent: 2, resets_at: 1796083200 },
+              subscription: { subscription_type: "QUICK_LITE_FREE_TRIAL", free_trial_metadata: { status: "ACTIVE", expiry_date: 1797688435 } },
+            })
+          if (path === "api/ws-rpc" && body?.type === "get_settings") return answer({ frames: [{ type: "autonomous_mode_status", payload: {} }, { type: "settings", payload: state.settings }] })
+          if (path?.startsWith("files/upload/")) {
+            const upload = state.uploads.find((u) => u.id === body?.attachmentId)
+            if (!upload) return answer({ error: "no such attachment" })
+            upload.thread = decodeURIComponent(path.slice("files/upload/".length))
+            return answer({ path: `/data/workspace/attached_files/${upload.name}` })
+          }
+          return Response.json({ eventResponse: { invokeAgentResponse: JSON.stringify({ type: "api_response", status: 404, body: {} }) } })
+        }
+        case "/integration/quick-work/upload-attachment": {
+          const bytes = new Uint8Array(await req.arrayBuffer())
+          const id = `att-${state.uploads.length + 1}`
+          state.uploads.push({ id, name: url.searchParams.get("name"), contentType: url.searchParams.get("contentType"), size: bytes.byteLength, text: new TextDecoder().decode(bytes) })
+          return Response.json({ attachmentId: id })
+        }
+        case "/integration/quick-work/attachment-dlp-status":
+          return Response.json({ dlpJobStatus: "COMPLETED", policyAction: "ALLOW" })
         case "/streaming/quickwork-chat-bidirectional-stream": {
           const token = url.searchParams.get("token") ?? ""
           if (!token || token === state.rejectToken) return new Response("unauthorized", { status: 401 })
@@ -120,9 +151,12 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
         } catch {
           return
         }
-        if (event.type === "session_delete") state.deleted.push(event.payload.session_id)
         if (event.type !== "user_message") return
+        // as Amazon Quick: a frame over 64 KB is refused
+        if (Buffer.byteLength(data) > 65536)
+          return ws.send(frame({ type: "error", code: "FrameTooLarge", message: "This message is over the 64 KB size limit, so it was not sent.", source: "sncs", retryable: false }))
         state.turns.push(event.payload)
+        if (event.payload.custom_prompt) state.custom.set(event.payload.thread_id, event.payload.custom_prompt)
         for (const out of reply(event.payload)) ws.send(frame(out))
       },
     },

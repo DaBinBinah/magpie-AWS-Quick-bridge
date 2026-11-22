@@ -1,15 +1,21 @@
 {
   "name": "magpie-aws-quick-bridge",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "OpenCode / magpie provider plugin: Amazon Quick (QuickWork) with its own desktop sign-in, as OpenAI-compatible chat with streaming and tool calls",
   "type": "module",
-  "main": "./index.mjs",
+  "main": "./opencode.mjs",
+  "exports": {
+    ".": "./opencode2.mjs"
+  },
   "files": [
     "index.mjs",
+    "opencode.mjs",
+    "opencode2.mjs",
     "plugin",
     "assets/icon-128.png",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "LICENSES"
   ],
   "keywords": [
     "opencode",
@@ -40,8 +46,8 @@
   "magpie": {
     "name": "magpie-AWS-Quick-bridge",
     "summary": {
-      "en": "Amazon Quick (QuickWork) for every agent: browser sign-in for personal and enterprise accounts, several accounts, automatic token renewal, streaming chat and client tool calls. Unofficial.",
-      "zh": "把 Amazon Quick（QuickWork）接入所有 agent：个人与企业账号浏览器登录、多账号、token 自动续期、流式对话与客户端工具调用。非官方。"
+      "en": "Amazon Quick (QuickWork) for every agent: browser sign-in for personal and enterprise accounts, several accounts, automatic token renewal, quota, streaming chat with thinking, client tool calls and long agent prompts. Unofficial.",
+      "zh": "把 Amazon Quick（QuickWork）接入所有 agent：个人与企业账号浏览器登录、多账号、token 自动续期、额度显示、流式对话与思考输出、客户端工具调用、超长提示词自动转附件。非官方。"
     },
     "maxConcurrency": 4,
     "options": {

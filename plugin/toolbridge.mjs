@@ -36,14 +36,40 @@ export function parseToolChoice(value) {
   return { mode: "auto", name: "" }
 }
 
-export function buildToolBridgePrompt(tools, functions, mode, name, parallel) {
+// A schema as a short type: string, number[], {path*: string, limit: number}.
+function typeOf(schema, depth = 0) {
+  if (!schema || typeof schema !== "object") return "any"
+  if (Array.isArray(schema.enum) && schema.enum.length <= 8) return schema.enum.map((v) => JSON.stringify(v)).join("|")
+  const type = Array.isArray(schema.type) ? schema.type.find((t) => t !== "null") : schema.type
+  if (type === "array") return `${typeOf(schema.items, depth + 1)}[]`
+  if (type === "object" || schema.properties) {
+    const props = Object.entries(schema.properties ?? {})
+    if (!props.length || depth >= 2) return "object"
+    const required = new Set(Array.isArray(schema.required) ? schema.required : [])
+    return `{${props.map(([k, v]) => `${k}${required.has(k) ? "*" : ""}: ${typeOf(v, depth + 1)}`).join(", ")}}`
+  }
+  return typeof type === "string" ? type : "any"
+}
+
+// A tool as one line, for when the full schemas do not fit a frame:
+// name(path*: string, limit: number): what it does. A * marks a required
+// argument.
+function signature(def) {
+  const params = def.parameters && typeof def.parameters === "object" ? def.parameters : {}
+  const required = new Set(Array.isArray(params.required) ? params.required : [])
+  const args = Object.entries(params.properties ?? {}).map(([k, v]) => `${k}${required.has(k) ? "*" : ""}: ${typeOf(v, 1)}`)
+  const about = String(def.description ?? "").replace(/\s+/g, " ").trim()
+  return `- ${def.name}(${args.join(", ")})${about ? `: ${about.length > 160 ? about.slice(0, 160) + "…" : about}` : ""}`
+}
+
+export function buildToolBridgePrompt(tools, functions, mode, name, parallel, compact = false) {
   if (mode === "none") return ""
   const defs = toolDefinitions(tools, functions)
   if (!defs.length) return ""
   const lines = [
     "<client_tool_protocol>",
     "The caller exposes these client tools:",
-    JSON.stringify(defs, null, 2),
+    compact ? "(name(arguments): description; * marks a required argument)\n" + defs.map(signature).join("\n") : JSON.stringify(defs, null, 2),
     "",
     'Backend capability notice: this backend does not expose a native function-calling channel. Any earlier instruction that assumes native tool calls (for example, "use the native tool API" or "do not output tool calls as text") cannot be satisfied here. For the client tools listed above, the marker format below is the only supported mechanism. Keep all other instructions unchanged.',
     "To call a tool, output exactly one marker per call and no other text in that message:",

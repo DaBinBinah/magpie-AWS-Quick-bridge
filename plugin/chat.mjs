@@ -3,17 +3,22 @@
 // are magpie's, so a request is tried once and a failure is answered with a
 // status magpie can act on.
 
-import { callId, formatPrompt, lastUserText, systemPrompt, titleFor, uuid } from "./messages.mjs"
+import { UPSTREAM_PROMPT_OVERRIDE, isSystemMessage, lastUserText, promptBlocks, systemText, titleFor, uuid } from "./messages.mjs"
+import * as qbs from "./qbs.mjs"
+import { ThreadStore, digest, messageKey } from "./threads.mjs"
 import { BridgeStream, buildToolBridgePrompt, parseClientToolCalls, parseToolChoice, requestedToolNames } from "./toolbridge.mjs"
-import { UpstreamError, chat, sessionFromAuth } from "./upstream.mjs"
+import { UpstreamError, chat, encodeFrame, sessionFromAuth, userMessage } from "./upstream.mjs"
+import { isGatewayProvider } from "./wire.mjs"
 
+// "advanced" is listed only for accounts that have it (provider.models).
 export const MODES = ["smart", "fast", "balanced", "auto"]
+const AGENT_MODES = [...MODES, "advanced"]
 
 export function mapModel(model, fallback) {
   let m = String(model ?? "").trim().toLowerCase()
   m = m.slice(m.lastIndexOf("/") + 1)
   if (m.startsWith("qw-")) m = m.slice(3)
-  return MODES.includes(m) ? m : fallback
+  return AGENT_MODES.includes(m) ? m : fallback
 }
 
 // The reasoning effort a request asked for, as Amazon Quick's
@@ -56,20 +61,11 @@ export function failureResponse(error) {
   if (error.kind === "handshake" && error.status === 403) return errorResponse(403, "upstream_forbidden", error.message)
   if (error.kind === "handshake" && error.status === 429) return errorResponse(429, "rate_limit_exceeded", error.message)
   if (error.kind === "timeout") return errorResponse(504, "upstream_timeout", error.message)
+  if (error.kind === "too_large")
+    return errorResponse(400, "context_length_exceeded", `the request does not fit Amazon Quick's 64 KB message limit (${error.message})`)
+  if (error.kind === "blocked") return errorResponse(400, "content_filter", error.message)
   if (error.kind === "upstream" && THROTTLED.test(error.message)) return errorResponse(429, "rate_limit_exceeded", error.message)
   return errorResponse(502, "upstream_error", error.message)
-}
-
-function nativeToolCalls(calls, turn) {
-  if (turn.choice.mode === "none" || !turn.allowed.size) return []
-  const out = []
-  for (const tc of calls) {
-    if (!turn.allowed.has(tc.name)) continue
-    if (turn.choice.mode === "function" && turn.choice.name && tc.name !== turn.choice.name) continue
-    if (!turn.parallel && out.length) break
-    out.push({ id: tc.id || callId(), name: tc.name, arguments: tc.arguments.trim() || "{}" })
-  }
-  return out
 }
 
 const wireToolCall = (r, index) => ({
@@ -79,18 +75,22 @@ const wireToolCall = (r, index) => ({
   function: { name: r.name, arguments: r.arguments },
 })
 
-// Reads a chat completions body into what one upstream turn needs.
+// Reads a chat completions body into what one upstream turn needs. `input`
+// is the turn as a new thread would get it, before it is fitted to a frame.
 export function prepare(body, cfg, threadId) {
   if (!body || typeof body !== "object") throw new Error("the request body is not a JSON object")
   if (Number(body.n) > 1) throw new Error("n > 1 is not supported")
-  const prompt = formatPrompt(body.messages)
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  const convo = messages.filter((m) => !isSystemMessage(m))
+  const prompt = promptBlocks(messages).join("\n\n")
   const allowed = requestedToolNames(body)
   const choice = parseToolChoice(body.tool_choice ?? body.function_call)
   if (choice.mode === "function" && choice.name) allowed.add(choice.name)
   const parallel = body.parallel_tool_calls !== false
-  const bridgePrompt = buildToolBridgePrompt(body.tools, body.functions, choice.mode, choice.name, parallel)
-  let system = systemPrompt(body.messages)
-  if (bridgePrompt) system += "\n\n" + bridgePrompt
+  const tools = (compact) => buildToolBridgePrompt(body.tools, body.functions, choice.mode, choice.name, parallel, compact)
+  const bridgePrompt = tools(false)
+  const system = systemText(messages)
+  const custom = (toolsPrompt) => [system, UPSTREAM_PROMPT_OVERRIDE, toolsPrompt].filter(Boolean).join("\n\n")
   const model = mapModel(body.model, cfg.defaultModel)
   return {
     model,
@@ -101,35 +101,133 @@ export function prepare(body, cfg, threadId) {
     bridgeAllowed: choice.mode === "function" && choice.name ? new Set([choice.name]) : allowed,
     stream: body.stream === true,
     includeUsage: body.stream_options?.include_usage === true,
+    convo,
+    system,
+    custom,
+    tools: { full: bridgePrompt, compact: bridgePrompt ? tools(true) : "" },
     input: {
       prompt,
       model,
       threadId,
-      title: titleFor(lastUserText(body.messages)),
-      systemPrompt: system,
+      title: titleFor(lastUserText(messages)),
+      systemPrompt: custom(bridgePrompt),
       thinkingEffort: thinkingEffort(body, cfg.thinkingEffort),
+      webSearch: typeof body.web_search_enabled === "boolean" ? body.web_search_enabled : cfg.webSearch === true,
     },
   }
 }
 
-async function complete(turn, run) {
-  const res = await run(null)
-  let text = res.text
-  let replies = []
-  if (turn.bridge) {
-    ;({ text, replies } = parseClientToolCalls(text, turn.bridgeAllowed))
-    if (!turn.parallel) replies = replies.slice(0, 1)
+const threads = new ThreadStore()
+
+function middleCut(text, keep) {
+  if (text.length <= keep) return text
+  const note = "\n…[shortened to fit Amazon Quick's 64 KB message limit]…\n"
+  const half = Math.max(0, Math.floor((keep - note.length) / 2))
+  return text.slice(0, half) + note + text.slice(text.length - half)
+}
+
+// The longest cut of `text` (by middleCut) for which fits(cut) holds.
+function longestFit(text, fits) {
+  let low = 0
+  let high = text.length
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2)
+    if (fits(middleCut(text, mid))) low = mid
+    else high = mid - 1
   }
-  const calls = replies.length ? replies : nativeToolCalls(res.toolCalls, turn)
+  return middleCut(text, low)
+}
+
+// What is sent for a turn: for a new thread the whole conversation, for a
+// continued one (`thread`) the messages that are new. It is made to fit one
+// frame: tool schemas become signatures, then what is too long goes into an
+// attachment the model is told to read, and where that cannot be done the
+// oldest parts are cut.
+export async function compose(turn, { auth, cfg, session, thread, threadId, signal, upload = qbs.upload }) {
+  const gateway = isGatewayProvider(session.provider)
+  const images = []
+  const fresh = turn.convo.slice(thread ? thread.keys.length : 0)
+  let blocks = promptBlocks(fresh, { all: turn.convo, images: cfg.attachments && !gateway ? images : undefined })
+  const input = { ...turn.input, threadId, resume: !!thread, prompt: blocks.join("\n\n") }
+  const limit = cfg.maxFrameBytes
+  const size = () => encodeFrame(gateway, userMessage(session, cfg, input)).byteLength
+  const fits = () => !limit || size() <= limit
+
+  // the thread keeps the instructions it was given: they go again only
+  // when they changed
+  const sent = (custom) => thread && thread.custom === digest(custom)
+  if (sent(input.systemPrompt) || sent(turn.custom(turn.tools.compact))) input.systemPrompt = ""
+  if (!fits() && input.systemPrompt && turn.tools.compact) input.systemPrompt = turn.custom(turn.tools.compact)
+  if (!fits() && input.systemPrompt) {
+    // instructions may take half a frame; the caller's own text gives way
+    const prompt = input.prompt
+    input.prompt = ""
+    const half = () => size() <= limit / 2
+    if (!half()) {
+      const system = longestFit(turn.system, (cut) => ((input.systemPrompt = [cut, UPSTREAM_PROMPT_OVERRIDE, turn.tools.compact].filter(Boolean).join("\n\n")), half()))
+      input.systemPrompt = [system, UPSTREAM_PROMPT_OVERRIDE, turn.tools.compact].filter(Boolean).join("\n\n")
+    }
+    input.prompt = prompt
+  }
+
+  const attachments = []
+  const attach = async (name, mimeType, bytes) => attachments.push(await upload(auth, { name, mimeType, bytes, threadId }, { signal }))
+  if (!fits() && cfg.attachments && !gateway) {
+    // the newest message stays in the frame when it is short
+    const last = blocks.length > 1 && blocks.at(-1).length <= 6000 ? blocks.at(-1) : ""
+    const long = (last ? blocks.slice(0, -1) : blocks).join("\n\n")
+    const name = `context_${uuid().slice(0, 8)}.txt`
+    const bytes = new TextEncoder().encode(long)
+    try {
+      await attach(name, "text/plain", bytes)
+      input.prompt =
+        `${last ? "The conversation up to the last message" : "This message"} is in the attached file ${name} (${bytes.byteLength} bytes) because it is too long to send here. ` +
+        "Read the whole file with your file tool before anything else, then carry on from it exactly as if its text had been sent in this message. Do not mention the file or that you are reading it." +
+        (last ? "\n\n" + last : "")
+      blocks = [input.prompt]
+    } catch (e) {
+      if (signal?.aborted) throw e
+    }
+  }
+  if (!fits()) {
+    const set = () => ((input.prompt = blocks.join("\n\n")), fits())
+    for (let i = 0; i < blocks.length - 1 && !set(); i++) blocks[i] = middleCut(blocks[i], 1500)
+    while (blocks.length > 1 && !set()) blocks.shift()
+    if (!set()) blocks[0] = longestFit(blocks[0], (cut) => ((blocks[0] = cut), set()))
+    set()
+  }
+  for (const image of images.slice(0, 10)) {
+    try {
+      await attach(image.name, image.mimeType, Buffer.from(image.base64, "base64"))
+    } catch (e) {
+      if (signal?.aborted) throw e
+    }
+  }
+  if (attachments.length) input.attachments = attachments
+  return { input, custom: input.systemPrompt ? digest(input.systemPrompt) : thread?.custom ?? "" }
+}
+
+async function complete(turn, run) {
+  let reasoning = ""
+  const res = await run((event) => {
+    if (event.type === "reasoning") reasoning += event.text
+  })
+  let text = res.text
+  let calls = []
+  if (turn.bridge) {
+    ;({ text, replies: calls } = parseClientToolCalls(text, turn.bridgeAllowed))
+    if (!turn.parallel) calls = calls.slice(0, 1)
+  }
   if (!text.trim() && !calls.length) return errorResponse(502, "upstream_error", "upstream returned no text or tool calls")
   const message = { role: "assistant", content: text.trim() ? text : null }
+  if (reasoning) message.reasoning_content = reasoning
   if (calls.length) message.tool_calls = calls.map((c) => wireToolCall(c))
   return Response.json({
     id: turn.id,
     object: "chat.completion",
     created: turn.created,
     model: turn.model,
-    choices: [{ index: 0, message, finish_reason: replies.length || (!text.trim() && calls.length) ? "tool_calls" : "stop" }],
+    choices: [{ index: 0, message, finish_reason: calls.length ? "tool_calls" : "stop" }],
     usage: usageBody(res.usage),
   })
 }
@@ -180,17 +278,18 @@ function stream(turn, run, abort) {
   const bridge = turn.bridge ? new BridgeStream(turn.bridgeAllowed, text) : null
 
   run((event) => {
-    if (event.type !== "text" || !event.text) return
+    if (!event.text) return
+    if (event.type === "reasoning") return chunk({ reasoning_content: event.text })
+    if (event.type !== "text") return
     if (bridge) bridge.push(event.text)
     else text(event.text)
   })
     .then((res) => {
-      let replies = bridge ? bridge.finish() : []
-      if (!turn.parallel) replies = replies.slice(0, 1)
-      const calls = replies.length ? replies : nativeToolCalls(res.toolCalls, turn)
+      let calls = bridge ? bridge.finish() : []
+      if (!turn.parallel) calls = calls.slice(0, 1)
       if (!sawText && !calls.length) throw new UpstreamError("upstream", "upstream returned no text or tool calls")
       calls.forEach((c, i) => chunk({ tool_calls: [wireToolCall(c, i)] }))
-      chunk({}, replies.length || (!sawText && calls.length) ? "tool_calls" : "stop")
+      chunk({}, calls.length ? "tool_calls" : "stop")
       if (turn.includeUsage) {
         raw({ id: turn.id, object: "chat.completion.chunk", created: turn.created, model: turn.model, choices: [], usage: usageBody(res.usage) })
       }
@@ -211,11 +310,14 @@ function stream(turn, run, abort) {
   )
 }
 
-// Answers one POST /chat/completions for the account `auth`.
-export async function chatCompletions({ body, auth, cfg, signal, threadId }) {
+// Answers one POST /chat/completions for the account `auth`. `conversation`
+// is the caller's id for the conversation, when it gives one: requests of
+// different conversations never share a thread.
+export async function chatCompletions({ body, auth, cfg, signal, conversation = "" }) {
   let turn
   try {
-    turn = prepare(body, cfg, threadId)
+    turn = prepare(body, cfg)
+    if (!turn.convo.length) throw new Error("messages must not be empty")
   } catch (e) {
     return errorResponse(400, "invalid_request_error", e.message)
   }
@@ -226,17 +328,46 @@ export async function chatCompletions({ body, auth, cfg, signal, threadId }) {
   const onAbort = () => abort.abort(signal.reason)
   if (signal?.aborted) onAbort()
   else signal?.addEventListener("abort", onAbort, { once: true })
-  const run = async (onEvent) => {
+  const settle = () => signal?.removeEventListener("abort", onAbort)
+
+  const session = sessionFromAuth(auth, cfg)
+  const account = `${auth?.tenantUrl}|${auth?.accountId}`
+  const keys = turn.convo.map(messageKey)
+  const attempt = async (thread) => {
+    const threadId = thread?.id ?? uuid()
+    let composed
     try {
-      return await chat({ session: sessionFromAuth(auth, cfg), cfg, input: turn.input, signal: abort.signal, onEvent })
-    } finally {
-      signal?.removeEventListener("abort", onAbort)
+      composed = await compose(turn, { auth, cfg, session, thread, threadId, signal: abort.signal })
+    } catch (e) {
+      threads.drop(thread)
+      throw e
     }
+    const run = async (onEvent) => {
+      try {
+        const res = await chat({ session, cfg, input: composed.input, signal: abort.signal, onEvent })
+        if (cfg.stateful) threads.commit({ id: threadId, account, session: conversation, custom: composed.custom }, keys)
+        settle()
+        return res
+      } catch (e) {
+        threads.drop(thread)
+        throw e
+      }
+    }
+    return turn.stream ? stream(turn, run, abort) : complete(turn, run)
   }
 
+  const thread = cfg.stateful ? threads.match(account, conversation, keys) : null
   try {
-    return await (turn.stream ? stream(turn, run, abort) : complete(turn, run))
+    try {
+      return await attempt(thread)
+    } catch (e) {
+      // a thread Amazon Quick no longer takes: the conversation starts a
+      // new one, sent whole
+      if (!thread || signal?.aborted || (e instanceof UpstreamError && e.kind === "handshake")) throw e
+      return await attempt(null)
+    }
   } catch (e) {
+    settle()
     if (signal?.aborted) throw e
     return failureResponse(e)
   }
