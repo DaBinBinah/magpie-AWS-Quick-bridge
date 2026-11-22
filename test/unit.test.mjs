@@ -222,7 +222,7 @@ describe("requests", () => {
     const zh = prepare({ messages: [{ role: "user", content: "在日志里搜索 用户状态异常" }], tools }, { defaultModel: "smart" })
     expect(zh.input.systemPrompt).toContain("I write in Chinese.")
     expect(zh.input.systemPrompt).toContain("never translate them")
-    expect(zh.tools.compact).toContain("I write in Chinese.")
+    expect(zh.tools(160)).toContain("I write in Chinese.")
     const en = prepare({ messages: [{ role: "user", content: "search the log" }], tools }, { defaultModel: "smart" })
     expect(en.input.systemPrompt).not.toContain("I write in")
     const plain = prepare({ messages: [{ role: "user", content: "在日志里搜索 用户状态异常" }] }, { defaultModel: "smart" })
@@ -263,5 +263,55 @@ describe("requests", () => {
       total_tokens: 20,
       prompt_tokens_details: { cached_tokens: 3 },
     })
+  })
+})
+
+describe("fitting a message", () => {
+  const cfg = settings({})
+  const tool = (i) => ({
+    type: "function",
+    function: { name: `mcp__server_${i}__do_some_thing_${i}`, description: "d".repeat(300), parameters: { type: "object", properties: { path: { type: "string" }, limit: { type: "number" } }, required: ["path"] } },
+  })
+  const sent = async ({ provider, tools, system, user, zh, upload }) => {
+    const ch = zh ? "中" : "a"
+    const body = { model: "smart", messages: [...(system ? [{ role: "system", content: (ch + '\n"q" ').repeat(system / 6) }] : []), { role: "user", content: ch.repeat(user) }] }
+    if (tools) body.tools = Array.from({ length: tools }, (_, i) => tool(i))
+    const turn = prepare(body, cfg, "t")
+    const session = _internal.upstream.sessionFromAuth({ idToken: "x", wsHost: "h", quickProvider: provider }, cfg)
+    const out = await _internal.compose(turn, {
+      auth: {},
+      cfg,
+      session,
+      thread: null,
+      threadId: "00000000-0000-0000-0000-000000000000",
+      upload: async (_, file) => {
+        if (!upload) throw new Error("no upload")
+        return { type: "file", name: file.name }
+      },
+    })
+    const message = _internal.upstream.userMessage(session, cfg, out.input)
+    return { input: out.input, json: Buffer.byteLength(JSON.stringify(message)), frame: _internal.upstream.encodeFrame(provider === "gateway", message).byteLength }
+  }
+
+  test("whatever the tools, the instructions and the message, what is sent is within the limit", async () => {
+    for (const provider of ["social", "gateway"])
+      for (const tools of [0, 20, 600])
+        for (const system of [0, 200_000])
+          for (const user of [20, 200_000])
+            for (const zh of [false, true])
+              for (const upload of provider === "gateway" ? [false] : [true, false]) {
+                const out = await sent({ provider, tools, system, user, zh, upload })
+                expect(provider === "gateway" ? out.frame : out.json).toBeLessThanOrEqual(cfg.maxFrameBytes)
+                if (tools) expect(out.input.systemPrompt).toContain("<client_tool_call>")
+              }
+  }, 30_000)
+
+  test("long instructions are shortened before the tools lose their arguments", async () => {
+    const out = await sent({ provider: "social", tools: 20, system: 200_000, user: 20, upload: true })
+    expect(out.input.systemPrompt).toContain('"name": "mcp__server_19__do_some_thing_19"')
+    expect(out.input.systemPrompt).toContain('"limit"')
+    expect(out.input.systemPrompt).toContain("shortened to fit")
+    expect(out.input.prompt).toBe("a".repeat(20))
+    expect(out.json).toBeGreaterThan(60_000)
   })
 })

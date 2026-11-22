@@ -20,6 +20,8 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
     settings: { advanced_mode_enabled: false, model_slots: {} },
     rejectToken: "", // an id_token the WebSocket upgrade answers 401
     script: null, // (payload) => events[], overrides the default reply
+    limit: 65_250, // the bytes of a user_message's JSON over which it is refused
+    refused: [], // the size of every message refused for it
   }
 
   const frame = (event) =>
@@ -145,16 +147,22 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
     websocket: {
       message(ws, data) {
         let event
+        let bytes
         try {
           const outer = JSON.parse(typeof data === "string" ? data : Buffer.from(data).toString("utf8"))
-          event = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"))
+          const inner = Buffer.from(outer.payload.payload, "base64")
+          bytes = inner.byteLength
+          event = JSON.parse(inner.toString("utf8"))
         } catch {
           return
         }
         if (event.type !== "user_message") return
-        // as Amazon Quick: a frame over 64 KB is refused
-        if (Buffer.byteLength(data) > 65536)
+        // as Amazon Quick: a message whose JSON is over some 65250 bytes is
+        // refused (state.limit, for a test to lower)
+        if (bytes > state.limit) {
+          state.refused.push(bytes)
           return ws.send(frame({ type: "error", code: "FrameTooLarge", message: "This message is over the 64 KB size limit, so it was not sent.", source: "sncs", retryable: false }))
+        }
         state.turns.push(event.payload)
         if (event.payload.custom_prompt) state.custom.set(event.payload.thread_id, event.payload.custom_prompt)
         for (const out of reply(event.payload)) ws.send(frame(out))

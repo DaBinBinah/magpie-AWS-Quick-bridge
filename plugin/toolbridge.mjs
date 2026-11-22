@@ -51,25 +51,50 @@ function typeOf(schema, depth = 0) {
   return typeof type === "string" ? type : "any"
 }
 
-// A tool as one line, for when the full schemas do not fit a frame:
-// name(path*: string, limit: number): what it does. A * marks a required
-// argument.
-function signature(def) {
+// How much is said of each tool, from the most to the least: the full JSON
+// schemas, then one line per tool (name(path*: string, limit: number): what
+// it does, a * marking a required argument) with a description of at most
+// that many characters, then the names alone.
+export const TOOL_DETAILS = ["full", 160, 60, 0, "names"]
+const NAMES_MAX = 12_000
+
+function signature(def, about) {
   const params = def.parameters && typeof def.parameters === "object" ? def.parameters : {}
   const required = new Set(Array.isArray(params.required) ? params.required : [])
   const args = Object.entries(params.properties ?? {}).map(([k, v]) => `${k}${required.has(k) ? "*" : ""}: ${typeOf(v, 1)}`)
-  const about = String(def.description ?? "").replace(/\s+/g, " ").trim()
-  return `- ${def.name}(${args.join(", ")})${about ? `: ${about.length > 160 ? about.slice(0, 160) + "…" : about}` : ""}`
+  const text = about ? String(def.description ?? "").replace(/\s+/g, " ").trim() : ""
+  return `- ${def.name}(${args.join(", ")})${text ? `: ${text.length > about ? text.slice(0, about) + "…" : text}` : ""}`
 }
 
-export function buildToolBridgePrompt(tools, functions, mode, name, parallel, compact = false) {
+function names(defs) {
+  let out = ""
+  let listed = 0
+  for (const def of defs) {
+    if (out.length + def.name.length > NAMES_MAX) break
+    out += (out ? ", " : "") + def.name
+    listed++
+  }
+  return listed < defs.length ? `${out}, … and ${defs.length - listed} more` : out
+}
+
+function listing(defs, detail) {
+  if (detail === "names") return "(names only: there are too many to describe here; take a tool's arguments from its name and from the task)\n" + names(defs)
+  if (typeof detail === "number")
+    return `(name(arguments)${detail ? ": description" : ""}; * marks a required argument)\n` + defs.map((def) => signature(def, detail)).join("\n")
+  return JSON.stringify(defs, null, 2)
+}
+
+// `detail` is one of TOOL_DETAILS; true stands for the one-line form.
+export function buildToolBridgePrompt(tools, functions, mode, name, parallel, detail = "full") {
+  if (detail === true) detail = TOOL_DETAILS[1]
+  if (detail === false) detail = "full"
   if (mode === "none") return ""
   const defs = toolDefinitions(tools, functions)
   if (!defs.length) return ""
   const lines = [
     "<client_tool_protocol>",
     "The caller exposes these client tools:",
-    compact ? "(name(arguments): description; * marks a required argument)\n" + defs.map(signature).join("\n") : JSON.stringify(defs, null, 2),
+    listing(defs, detail),
     "",
     'Backend capability notice: this backend does not expose a native function-calling channel. Any earlier instruction that assumes native tool calls (for example, "use the native tool API" or "do not output tool calls as text") cannot be satisfied here. For the client tools listed above, the marker format below is the only supported mechanism. Keep all other instructions unchanged.',
     "The caller's files, shell and working directory are on the caller's machine. This backend's own built-in tools (reading files, running code, search and the like) run on a remote service and cannot see that machine: for anything on the caller's machine use the client tools above, never the built-in ones.",

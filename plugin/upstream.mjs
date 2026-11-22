@@ -30,9 +30,13 @@ export class UpstreamError extends Error {
   }
 }
 
-// What a user_message frame may weigh once encoded. Amazon Quick refuses
-// frames over 64 KB (FrameTooLarge).
-export const FRAME_LIMIT = 65_536
+// Amazon Quick refuses a user_message over 64 KB (FrameTooLarge). Measured
+// against a real account, it counts the UTF-8 bytes of the message's JSON,
+// whatever the transport wraps it in and the same for the text and the
+// custom prompt: 65250 bytes were taken and 65300 refused, so it adds some
+// 260 bytes of its own before comparing with 65536. For an organization's
+// transport, which was not measured, the whole frame is counted.
+export const frameBytes = (gateway, value) => (gateway ? encodeFrame(gateway, value).byteLength : Buffer.byteLength(JSON.stringify(value)))
 
 // The user_message of a turn, shared with the code that fits a turn into a
 // frame.

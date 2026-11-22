@@ -259,11 +259,56 @@ describe("a conversation over several requests", () => {
   })
 
   test("what does not fit a 64 KB frame: schemas become signatures, long text an attachment", async () => {
-    const big = Array.from({ length: 40 }, (_, i) => ({ type: "function", function: { name: `tool_${i}`, description: "d".repeat(900), parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } }))
-    await post({ model: "smart", tools: big, messages: [system, { role: "user", content: "hello" }] })
+    const tool = (i) => ({ type: "function", function: { name: `tool_${i}`, description: "d".repeat(900), parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } })
+    const big = Array.from({ length: 80 }, (_, i) => tool(i))
+    expect((await post({ model: "smart", tools: big, messages: [system, { role: "user", content: "hello" }] })).status).toBe(200)
     let turn = mock.state.turns.at(-1)
-    expect(turn.custom_prompt).toContain("- tool_0(path*: string): ddd")
+    expect(turn.custom_prompt).toContain("- tool_0(path*: string): " + "d".repeat(160) + "…\n")
     expect(turn.custom_prompt).not.toContain('"parameters"')
+    expect(turn.text).toStartWith("hello\n\n")
+
+    // more tools than one line each has room for: shorter lines, then the names alone
+    expect((await post({ model: "smart", tools: Array.from({ length: 600 }, (_, i) => tool(i)), messages: [system, { role: "user", content: "hello" }] })).status).toBe(200)
+    turn = mock.state.turns.at(-1)
+    expect(turn.custom_prompt).toStartWith("You are a coding agent.")
+    expect(turn.custom_prompt).toContain("- tool_599(path*: string): " + "d".repeat(60) + "…\n")
+    expect((await post({ model: "smart", tools: Array.from({ length: 4000 }, (_, i) => tool(i)), messages: [system, { role: "user", content: "hello" }] })).status).toBe(200)
+    turn = mock.state.turns.at(-1)
+    expect(turn.custom_prompt).toContain("(names only")
+    expect(turn.custom_prompt).toContain("tool_0, tool_1, tool_2")
+    expect(turn.custom_prompt).toMatch(/, … and \d+ more\n/)
+    expect(turn.custom_prompt).toContain("<client_tool_call>")
+
+    // a system prompt longer than a message, in Chinese: shortened, the tools and the question kept
+    const long = { role: "system", content: "你是一个编程助手。" + "规则：保持简洁。\n".repeat(20000) }
+    expect((await post({ model: "smart", tools: big.slice(0, 20), messages: [long, { role: "user", content: "讲个笑话" }] })).status).toBe(200)
+    turn = mock.state.turns.at(-1)
+    expect(turn.custom_prompt).toStartWith("你是一个编程助手。")
+    expect(turn.custom_prompt).toContain("shortened to fit")
+    expect(turn.custom_prompt).toContain('"name": "tool_19"')
+    expect(Buffer.byteLength(JSON.stringify(turn))).toBeGreaterThan(60_000)
+    expect(turn.text).toStartWith("讲个笑话\n\n")
+    expect(mock.state.refused).toEqual([])
+
+    // refused although it was measured to fit: sent once more, smaller
+    mock.state.limit = 50_000
+    const res2 = await post({ model: "smart", tools: big, messages: [system, { role: "user", content: "x".repeat(40_000) }] })
+    mock.state.limit = 65_250
+    expect(res2.status).toBe(200)
+    expect(mock.state.refused.length).toBe(1)
+    expect(mock.state.refused[0]).toBeLessThanOrEqual(63_000)
+    mock.state.refused.length = 0
+
+    // what cannot be made to fit is said here, not sent
+    const { fetch: send, baseURL } = await hooks.auth.loader(async () => auth)
+    const turns = mock.state.turns.length
+    const tiny = await plugin.server({ client: { auth: { set: async () => {} } }, directory: "/tmp" }, { oidc_base: mock.url, discovery_url: mock.url + "/sn", data_plane_url: mock.url, callback_port: 0, max_frame_bytes: 300 })
+    const none = await (await tiny.auth.loader(async () => auth)).fetch(`${baseURL}/chat/completions`, { method: "POST", body: JSON.stringify({ model: "smart", messages: [{ role: "user", content: "hello" }] }) })
+    expect(none.status).toBe(400)
+    expect((await none.json()).error).toMatchObject({ code: "context_length_exceeded" })
+    expect(mock.state.turns.length).toBe(turns)
+    expect(mock.state.refused).toEqual([])
+    void send
 
     const log = "line\n".repeat(30000)
     const res = await post({ model: "smart", messages: [{ role: "user", content: "first" }, { role: "assistant", content: "ok" }, { role: "user", content: log }, { role: "assistant", content: "seen" }, { role: "user", content: "and now?" }] })

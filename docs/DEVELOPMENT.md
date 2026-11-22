@@ -24,7 +24,7 @@ magpie plugin options magpie-AWS-Quick-bridge '{"thinking_effort": "medium", "ti
 | `web_search` | `false` | 允许 Amazon Quick 使用它自己的联网搜索；请求里的 `web_search_enabled` 优先 |
 | `stateful` | `true` | 多轮对话复用服务端线程、只发新增消息；`false` 时每次请求重发全部历史 |
 | `attachments` | `true` | 放不进一帧的内容和图片上传为附件；`false` 时改为截断较早的内容 |
-| `max_frame_bytes` | `60000` | 一帧里留给提示词的字节数上限，超过就压缩或转附件；`0` 关闭这项处理 |
+| `max_frame_bytes` | `63000` | 一条消息（JSON，UTF-8 字节）的大小上限，超过就压缩或转附件；`0` 关闭这项处理 |
 | `app_version` | `1.2.4660` | 上游握手使用的 appVersion |
 | `surface` | `QUICK_WORK_DESKTOP_WINDOWS` | 上游握手使用的 surfaceType |
 | `outpost_id` / `working_session_id` | 空 | 上游握手可选字段 |
@@ -74,7 +74,7 @@ sequenceDiagram
 
 - 每个请求打开一条到 Amazon Quick 的 WebSocket，把要发送的消息转成一条 `user_message`：单条用户消息原样发送，多轮对话和工具结果按 `User:` / `Assistant tool call (...)` / `Tool result (...)` 渲染。
 - 线程复用：Magpie 通过 `chat.headers` 钩子把会话 ID 带给插件；同一账号、同一会话、历史前缀一致的请求会接到上一轮的服务端线程上，只发新增消息，系统提示词没变也不重发。历史被改写（压缩、回退）或线程缓存过期（内存里保留 6 小时）时，开新线程重发全部历史。
-- 64 KB 帧上限：按“完整工具定义 → 一行签名 → 缩短系统提示词（最多占半帧）→ 过长内容转附件 → 截断较早的内容”的顺序处理，直到一帧放得下。附件经 Amazon Quick 的上传接口和 DLP 检查后挂到线程上，由模型用它自己的文件工具读取。
+- 64 KB 消息上限：我用真实账号测过，Amazon Quick 按消息 JSON 的 UTF-8 字节数计算（中文每个字 3 字节，系统提示词和正文算在一起），65250 字节能发，65300 字节被拒，所以默认按 63000 字节控制。超出时按这个顺序处理，直到放得下：工具说明逐级缩短（完整定义 → 一行签名，描述 160 字 → 60 字 → 不带描述 → 只列工具名）→ 缩短系统提示词 → 过长的对话内容转附件 → 截断较早的内容。工具再多也不会把超限的消息发出去；万一 Amazon Quick 仍然拒收，会自动缩小到 70% 再发一次。实在放不下（比如把 `max_frame_bytes` 设得很小）时直接在本地报错，不发送。附件经 Amazon Quick 的上传接口和 DLP 检查后挂到线程上，由模型用它自己的文件工具读取。
 - 工具只在客户端执行：插件把模型输出的 `<client_tool_call>{"name":…,"arguments":…}</client_tool_call>` 转成 `tool_calls`，下一轮再把工具结果作为文本带回去。`tool_choice: "none"` 关闭桥接，指定函数时只接受该函数。带工具的每条消息末尾还会加一句提醒：文件和终端在用户自己的电脑上，要用上面的标记调用工具，Amazon Quick 自带的工具看不到这台电脑。没有这句时，`fast` 档常常直接去用自带工具找文件。
 - 系统提示词放在 `custom_prompt` 里。agent 开头那句自报家门（如 “You are Claude Code, Anthropic's official CLI for Claude.”）会换成一句“这段对话来自用户电脑上的编程 agent”，Claude Code 的计费头那一行会去掉：Amazon Quick 不是这些产品，被要求扮演时容易纠结身份而不干活。
 - 用户用中文、日文或韩文写的时候（看最近 4 条用户消息里用户自己打的字），带工具的请求会多一句说明：用这种语言思考和回复，工具参数里的文件名、路径、日志、报错和搜索词照原文抄，不要翻译。Amazon Quick 默认用英文思考，会把中文日志翻成英文再去搜，结果搜不到。

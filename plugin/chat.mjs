@@ -6,8 +6,8 @@
 import { UPSTREAM_PROMPT_OVERRIDE, isSystemMessage, languageNote, lastUserText, promptBlocks, systemText, titleFor, uuid } from "./messages.mjs"
 import * as qbs from "./qbs.mjs"
 import { ThreadStore, digest, messageKey } from "./threads.mjs"
-import { BridgeStream, TOOL_REMINDER, buildToolBridgePrompt, parseClientToolCalls, parseToolChoice, requestedToolNames } from "./toolbridge.mjs"
-import { UpstreamError, chat, encodeFrame, sessionFromAuth, userMessage } from "./upstream.mjs"
+import { BridgeStream, TOOL_DETAILS, TOOL_REMINDER, buildToolBridgePrompt, parseClientToolCalls, parseToolChoice, requestedToolNames } from "./toolbridge.mjs"
+import { UpstreamError, chat, frameBytes, sessionFromAuth, userMessage } from "./upstream.mjs"
 import { isGatewayProvider } from "./wire.mjs"
 
 // "advanced" is listed only for accounts that have it (provider.models).
@@ -92,11 +92,14 @@ export function prepare(body, cfg, threadId) {
   // with tools, the language the user writes in is named: the tools' arguments
   // are then the user's own words, not a translation of them
   const language = languageNote(convo)
-  const tools = (compact) => {
-    const prompt = buildToolBridgePrompt(body.tools, body.functions, choice.mode, choice.name, parallel, compact)
-    return prompt && language ? prompt + "\n\n" + language : prompt
+  const said = new Map()
+  const tools = (detail) => {
+    if (said.has(detail)) return said.get(detail)
+    const prompt = buildToolBridgePrompt(body.tools, body.functions, choice.mode, choice.name, parallel, detail)
+    said.set(detail, prompt && language ? prompt + "\n\n" + language : prompt)
+    return said.get(detail)
   }
-  const bridgePrompt = tools(false)
+  const bridgePrompt = tools("full")
   const system = systemText(messages)
   const custom = (toolsPrompt) => [system, UPSTREAM_PROMPT_OVERRIDE, toolsPrompt].filter(Boolean).join("\n\n")
   const model = mapModel(body.model, cfg.defaultModel)
@@ -112,7 +115,7 @@ export function prepare(body, cfg, threadId) {
     convo,
     system,
     custom,
-    tools: { full: bridgePrompt, compact: bridgePrompt ? tools(true) : "" },
+    tools: (detail) => (bridgePrompt ? tools(detail) : ""),
     input: {
       prompt,
       model,
@@ -149,9 +152,9 @@ function longestFit(text, fits) {
 
 // What is sent for a turn: for a new thread the whole conversation, for a
 // continued one (`thread`) the messages that are new. It is made to fit one
-// frame: tool schemas become signatures, then what is too long goes into an
-// attachment the model is told to read, and where that cannot be done the
-// oldest parts are cut.
+// message: the tools are described more briefly, then the instructions are
+// shortened, then what is too long goes into an attachment the model is told
+// to read, and where that cannot be done the oldest parts are cut.
 export async function compose(turn, { auth, cfg, session, thread, threadId, signal, upload = qbs.upload }) {
   const gateway = isGatewayProvider(session.provider)
   const images = []
@@ -159,23 +162,30 @@ export async function compose(turn, { auth, cfg, session, thread, threadId, sign
   let blocks = promptBlocks(fresh, { all: turn.convo, images: cfg.attachments && !gateway ? images : undefined })
   const input = { ...turn.input, threadId, resume: !!thread, prompt: blocks.join("\n\n") }
   const limit = cfg.maxFrameBytes
-  const size = () => encodeFrame(gateway, userMessage(session, cfg, input)).byteLength
+  const size = () => frameBytes(gateway, userMessage(session, cfg, input))
   const fits = () => !limit || size() <= limit
 
-  // the thread keeps the instructions it was given: they go again only
-  // when they changed
-  const sent = (custom) => thread && thread.custom === digest(custom)
-  if (sent(input.systemPrompt) || sent(turn.custom(turn.tools.compact))) input.systemPrompt = ""
-  if (!fits() && input.systemPrompt && turn.tools.compact) input.systemPrompt = turn.custom(turn.tools.compact)
-  if (!fits() && input.systemPrompt) {
-    // instructions may take half a frame; the caller's own text gives way
+  // the thread keeps the instructions it was given, in the form that
+  // fitted: they go again only when the caller's own changed
+  const asked = digest(turn.input.systemPrompt)
+  if (thread && thread.custom === asked) input.systemPrompt = ""
+  const instructed = input.systemPrompt !== ""
+  if (!fits() && instructed) {
+    // a short message is sent whole beside the instructions; a long one
+    // gives way, and the instructions may take half of what can be sent
     const prompt = input.prompt
-    input.prompt = ""
-    const half = () => size() <= limit / 2
-    if (!half()) {
-      const system = longestFit(turn.system, (cut) => ((input.systemPrompt = [cut, UPSTREAM_PROMPT_OVERRIDE, turn.tools.compact].filter(Boolean).join("\n\n")), half()))
-      input.systemPrompt = [system, UPSTREAM_PROMPT_OVERRIDE, turn.tools.compact].filter(Boolean).join("\n\n")
-    }
+    input.systemPrompt = ""
+    const short = size() <= limit / 2
+    if (!short) input.prompt = ""
+    const bare = size()
+    const room = short ? limit : limit / 2
+    const set = (system, detail) => ((input.systemPrompt = [system, UPSTREAM_PROMPT_OVERRIDE, turn.tools(detail)].filter(Boolean).join("\n\n")), size())
+    // the tools said as fully as leaves the caller's instructions whole, or
+    // as takes half of the room at most, the instructions then shortened
+    // into the rest
+    const whole = (detail) => set(turn.system, detail) <= room
+    const detail = TOOL_DETAILS.find((d) => whole(d) || set("", d) - bare <= (room - bare) / 2) ?? TOOL_DETAILS.at(-1)
+    if (!whole(detail)) set(longestFit(turn.system, (cut) => set(cut, detail) <= room), detail)
     input.prompt = prompt
   }
 
@@ -213,7 +223,8 @@ export async function compose(turn, { auth, cfg, session, thread, threadId, sign
     }
   }
   if (attachments.length) input.attachments = attachments
-  return { input, custom: input.systemPrompt ? digest(input.systemPrompt) : thread?.custom ?? "" }
+  if (!fits()) throw new UpstreamError("too_large", `${size()} bytes after shortening, over ${limit}`)
+  return { input, custom: instructed ? asked : thread?.custom ?? "" }
 }
 
 async function complete(turn, run) {
@@ -353,7 +364,14 @@ export async function chatCompletions({ body, auth, cfg, signal, conversation = 
     }
     const run = async (onEvent) => {
       try {
-        const res = await chat({ session, cfg, input: composed.input, signal: abort.signal, onEvent })
+        const res = await chat({ session, cfg, input: composed.input, signal: abort.signal, onEvent }).catch(async (e) => {
+          // refused as too large although it was measured to fit: nothing
+          // was taken, so it is sent once more, made smaller
+          if (!(e instanceof UpstreamError) || e.kind !== "too_large" || !cfg.maxFrameBytes) throw e
+          const smaller = { ...cfg, maxFrameBytes: Math.floor(cfg.maxFrameBytes * 0.7) }
+          composed = await compose(turn, { auth, cfg: smaller, session, thread, threadId, signal: abort.signal })
+          return chat({ session, cfg, input: composed.input, signal: abort.signal, onEvent })
+        })
         if (cfg.stateful) threads.commit({ id: threadId, account, session: conversation, custom: composed.custom }, keys)
         settle()
         return res

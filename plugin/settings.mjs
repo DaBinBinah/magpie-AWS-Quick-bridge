@@ -34,8 +34,8 @@ export function settings(options = {}) {
     // false: every request starts a new thread and sends the whole conversation
     stateful: options.stateful !== false,
     attachments: options.attachments !== false,
-    // what a frame may weigh; Amazon Quick's limit is 64 KB (65536). 0 sends any size
-    maxFrameBytes: Number.isInteger(options.max_frame_bytes) && options.max_frame_bytes >= 0 ? options.max_frame_bytes : 60_000,
+    // what a message may weigh; Amazon Quick refuses one somewhat under 64 KB (see frameBytes). 0 sends any size
+    maxFrameBytes: Number.isInteger(options.max_frame_bytes) && options.max_frame_bytes >= 0 ? options.max_frame_bytes : 63_000,
     defaultModel: mapModel(options.default_model, "smart"),
     requestTimeoutMs: durationMs(options.request_timeout, 5 * 60_000),
     proxy: text(options.proxy),
