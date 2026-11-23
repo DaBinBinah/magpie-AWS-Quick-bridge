@@ -120,7 +120,7 @@ export function normalizeUserInfo(raw) {
     email: pick("email", "emailAddress"),
     userName: pick("userName", "user_name", "username"),
     displayName: pick("displayName", "display_name"),
-    userArn: pick("userArn", "user_arn"),
+    userArn: pick("userArn", "user_arn", "quicksightExternalUserArn", "quicksight_external_user_arn"),
     awsAccountId: pick("awsAccountId", "aws_account_id", "accountId"),
     accountName: pick("accountName", "account_name"),
   }
@@ -239,14 +239,44 @@ export function claimedUserInfo(tokens) {
   }
 }
 
+const ACCOUNT_ID = /^\d{12}$/
+
+// Who a Gateway account is: what its tokens say, and what they leave out
+// asked of the tenant's "current user". The account API is addressed by the
+// AWS account, so without it the allowance can't be read. That a tenant
+// answers this call with these tokens is reported, not something I have
+// seen, so anything but an answer leaves what the tokens said; an account
+// whose AWS account and ARN are known (`known`, at a renewal) is not asked.
+async function gatewayUserInfo(tenantUrl, tokens, known) {
+  const claimed = claimedUserInfo(tokens)
+  const kept = (v) => String(v ?? "").trim()
+  if ((claimed.awsAccountId || kept(known?.awsAccountId)) && (claimed.userArn || kept(known?.actorArn))) return claimed
+  const tenant = kept(tenantUrl).replace(/\/+$/, "")
+  if (!tenant) return claimed
+  let asked
+  try {
+    const raw = await request(`${tenant.includes("://") ? tenant : "https://" + tenant}/identityservice/users/currentUser`, {
+      headers: { accept: "application/json", authorization: `Bearer ${tokens.accessToken}` },
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+    })
+    asked = normalizeUserInfo(["user_info", "UserInfo", "user"].map((k) => raw[k]).find((v) => v && typeof v === "object") ?? raw)
+  } catch {
+    return claimed
+  }
+  if (!asked.userArn.startsWith("arn:")) asked.userArn = ""
+  if (!ACCOUNT_ID.test(asked.awsAccountId)) asked.awsAccountId = /^arn:[^:]*:[^:]*:[^:]*:(\d{12}):/.exec(asked.userArn)?.[1] ?? ""
+  return Object.fromEntries(Object.keys(claimed).map((k) => [k, claimed[k] || asked[k] || ""]))
+}
+
 const unknownOperation = (e) => e instanceof HTTPError && e.status === 404 && /UnknownOperation/i.test(e.body)
 
 // The account's details and the provider it turned out to be: an
 // organization's tenant that answers user-info as the Gateway does (404
 // UnknownOperationException) is one, whatever its host is called.
-async function fetchUserInfo(provider, stage, tenantUrl, tokens) {
+async function fetchUserInfo(provider, stage, tenantUrl, tokens, known) {
   if (!tokens.accessToken) throw new Error("token response has no access_token")
-  if (isGateway(provider)) return { provider, info: claimedUserInfo(tokens) }
+  if (isGateway(provider)) return { provider, info: await gatewayUserInfo(tenantUrl, tokens, known) }
   const base = userInfoBase(provider, stage, tenantUrl).replace(/\/+$/, "")
   if (!base) throw new Error("discovery response has no tenant_url")
   try {
@@ -254,7 +284,7 @@ async function fetchUserInfo(provider, stage, tenantUrl, tokens) {
     return { provider, info: normalizeUserInfo(raw) }
   } catch (e) {
     if (provider !== "enterprise" || !unknownOperation(e)) throw e
-    return { provider: "gateway", info: claimedUserInfo(tokens) }
+    return { provider: "gateway", info: await gatewayUserInfo(tenantUrl, tokens, known) }
   }
 }
 
@@ -360,7 +390,7 @@ export async function refresh(auth) {
   }
   const tokens = tokensFrom(raw)
   if (!tokens.accessToken) throw new Error("refresh returned no access_token")
-  const who = await fetchUserInfo(provider, normalizedStage(auth.stage), auth.tenantUrl, tokens)
+  const who = await fetchUserInfo(provider, normalizedStage(auth.stage), auth.tenantUrl, tokens, auth)
   return sessionFields({ ...auth, quickProvider: who.provider, stage: normalizedStage(auth.stage) }, tokens, who.info)
 }
 
@@ -445,6 +475,8 @@ export class LoginFlow {
         tenantUrl: q("tenantUrl", "tenant_url"),
         region: q("region"),
         idcRegion: "",
+        // the AWS account the tenant is in, when the sign-in page names it
+        account: [q("account", "awsAccountId", "aws_account_id", "accountId")].find((v) => ACCOUNT_ID.test(v)) ?? "",
       }
       if (!this.discovery.authEndpoint || !this.discovery.tokenEndpoint)
         throw new StepError(400, "discovery response is missing authEndpoint/tokenEndpoint")
@@ -546,7 +578,7 @@ export class LoginFlow {
     }
     let info
     try {
-      const who = await fetchUserInfo(this.provider, this.stage, this.discovery.tenantUrl, tokens)
+      const who = await fetchUserInfo(this.provider, this.stage, this.discovery.tenantUrl, tokens, { awsAccountId: this.discovery.account })
       this.provider = who.provider
       info = who.info
     } catch (e) {
@@ -559,6 +591,7 @@ export class LoginFlow {
         stage: this.stage,
         region: d.region || this.region,
         tenantUrl: d.tenantUrl,
+        awsAccountId: d.account ?? "",
         clientId: this.clientId,
         clientSecret: this.clientSecret,
         issuerUrl: d.issuerUrl,

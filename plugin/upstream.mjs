@@ -137,6 +137,40 @@ export function dialInfo(sess) {
 
 // The HTTP status a refused upgrade got. Not every Bun build reports it on
 // the WebSocket error, so the upgrade is asked for once more over fetch.
+const loopback = (host) => host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127\./.test(host)
+
+// The proxy a chat WebSocket to `url` goes through, "" for none: the `proxy`
+// option ("direct" for none), or else the one of the environment. Magpie
+// gives a plugin's fetches its proxy by itself, and a WebSocket none, so the
+// chat went straight out where sign-in went through the proxy. It starts
+// the plugin with its global proxy as MAGPIE_*_PROXY (a SOCKS one as an
+// HTTP bridge to it); the plain *_PROXY are read after those. A provider's
+// or an account's own proxy in Magpie is not in the environment: the
+// `proxy` option names that one. Bun's WebSocket takes http(s) proxies, and
+// reads none from the environment itself. Node's takes no proxy option at
+// all: it goes through *_PROXY when started with NODE_USE_ENV_PROXY=1.
+export function proxyFor(url, cfg, env = process.env) {
+  const own = String(cfg?.proxy ?? "").trim()
+  if (/^(direct|none|off)$/i.test(own)) return ""
+  if (own) return own
+  let to
+  try {
+    to = new URL(url)
+  } catch {
+    return ""
+  }
+  const host = to.hostname.toLowerCase().replace(/^\[|\]$/g, "")
+  if (loopback(host)) return ""
+  const read = (k) => [`MAGPIE_${k}`, `MAGPIE_${k.toLowerCase()}`, k, k.toLowerCase()].map((n) => String(env[n] ?? "").trim()).find(Boolean) ?? ""
+  const skipped = read("NO_PROXY")
+    .split(",")
+    .map((n) => n.trim().toLowerCase().replace(/^\*?\./, ""))
+    .filter(Boolean)
+  if (skipped.some((n) => n === "*" || host === n || host.endsWith("." + n))) return ""
+  const secure = to.protocol === "wss:" || to.protocol === "https:"
+  return [secure ? "HTTPS_PROXY" : "HTTP_PROXY", "ALL_PROXY"].map(read).find((p) => /^https?:\/\//i.test(p)) ?? ""
+}
+
 async function upgradeStatus(url, headers, proxy) {
   try {
     const res = await fetch(url.replace(/^ws/, "http"), {
@@ -204,8 +238,9 @@ export function chat({ session, cfg, input, signal, onEvent }) {
     let handshakeTimer = null
     let requestTimer = null
 
+    const proxy = proxyFor(url, cfg)
     const options = { headers }
-    if (cfg.proxy) options.proxy = cfg.proxy
+    if (proxy) options.proxy = proxy
     let ws
     try {
       ws = new WebSocket(url, options)
@@ -558,7 +593,7 @@ export function chat({ session, cfg, input, signal, onEvent }) {
         const status = Number(/status code: (\d{3})/.exec(message)?.[1]) || 0
         if (status || !/Expected 101/.test(message)) return dialFailed(status)
         refused = true
-        return void upgradeStatus(url, headers, cfg.proxy).then(dialFailed)
+        return void upgradeStatus(url, headers, proxy).then(dialFailed)
       }
       dropped(new UpstreamError("transport", `upstream WebSocket read: ${message}`))
     }

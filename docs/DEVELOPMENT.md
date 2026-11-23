@@ -34,7 +34,7 @@ magpie plugin options magpie-AWS-Quick-bridge '{"thinking_effort": "medium", "ti
 | `callback_port` | `18080` | 本机 OAuth 回调端口；`0` 为任意空闲端口 |
 | `login_timeout` | `30m` | 等待浏览器完成登录的时间 |
 | `build_stage` | `prod` | `prod`、`beta`、`integ`、`dev` |
-| `proxy` | 空 | 聊天 WebSocket 使用的代理地址（见下面的限制） |
+| `proxy` | 空 | 聊天 WebSocket 使用的代理地址；留空时用环境变量里的代理，`direct` 表示不走代理（见下面的限制） |
 | `oidc_base` / `discovery_url` / `data_plane_url` | 空 | 覆盖上游地址，仅用于测试（模拟上游） |
 
 改动选项会重启插件宿主，从下一个请求起生效。
@@ -77,7 +77,7 @@ sequenceDiagram
 
 - 每个请求打开一条到 Amazon Quick 的 WebSocket，把要发送的消息转成一条 `user_message`：单条用户消息原样发送，多轮对话和工具结果按 `User:` / `Assistant tool call (...)` / `Tool result (...)` 渲染。
 - 设备 ID：桌面端连接时带着它自己的设备 ID（`outpostId`），不发空值（这一点我没有自己抓包核对）。所以每个账号登录时生成一个 UUID，存在账号记录里，续期令牌时保留；本机 API 上同一个账号重新登录也保留。不同账号的 ID 不同，不会轮换。0.3.8 之前登录的账号在下一次续期令牌时得到一个，在那之前仍发空值。`gateway` / `social_gateway` 账号不受影响。我用真实账号测过：带上 ID 后回答、用量和不带时一样，两个请求同时用同一个 ID 也都正常；它没有带来别的功能，本机没有 Amazon Quick 的代理程序，需要连着设备的功能（读本机文件、操作本机应用）仍然没有。
-- 企业租户的两条线路：企业账号的租户要么在 App Integrations 上（`enterprise`），要么在 Gateway 上（`gateway`，地址是 `<租户>.<区域>.enterprise.quick.aws.com`，2026 年 10 月之前中间还有一段 `desktop.`）。Gateway 上没有 `/integration/quick-work/user-info`，问它会得到 404 `UnknownOperationException`，0.3.9 及之前的版本，这类租户的登录就停在这一步。现在登录时按租户地址判断线路，选的是“企业账号”也会自动改成 `gateway`；地址认不出但 user-info 得到这个 404 的，同样当作 Gateway。Gateway 账号不问 user-info，邮箱、用户 ARN 和 AWS 账号 ID 从令牌的声明里读（这种令牌里有哪些声明我没见过，按常见的名字读），都读不到时账号名用租户的主机名，AWS 账号 ID 留空，这时额度查询多半查不到，对话不受影响。对话的 WebSocket 先问租户的 `/v1/discovery`，拨它给的 cell 地址（桌面端也是这样），问不到或拨不通就拨租户地址；账号 API 走租户地址上的 `/accounts/<AWS 账号 ID>/invocations/rpc`。这一整条线路我没有真实账号，只对 `test/organization.test.mjs` 里的模拟租户验证过。 Gateway 上的对话连接和账号接口、节点查询一样带 access token（它被 Gateway 接受这一点有依据：反馈者的 access token 在 user-info 上得到的是 404，而不带令牌或令牌不对时是 401）；令牌回应里同时有 id_token 时也不用它，App Integrations 线路照旧先用 id_token。
+- 企业租户的两条线路：企业账号的租户要么在 App Integrations 上（`enterprise`），要么在 Gateway 上（`gateway`，地址是 `<租户>.<区域>.enterprise.quick.aws.com`，2026 年 10 月之前中间还有一段 `desktop.`）。Gateway 上没有 `/integration/quick-work/user-info`，问它会得到 404 `UnknownOperationException`，0.3.9 及之前的版本，这类租户的登录就停在这一步。现在登录时按租户地址判断线路，选的是“企业账号”也会自动改成 `gateway`；地址认不出但 user-info 得到这个 404 的，同样当作 Gateway。Gateway 账号不问 user-info，邮箱、用户 ARN 和 AWS 账号 ID 从令牌的声明里读（这种令牌里有哪些声明我没见过，按常见的名字读），令牌里缺 AWS 账号 ID 或用户 ARN 时再补两处：登录页回调里的 `account`（是 12 位数字才用），和租户地址上的 `GET /identityservice/users/currentUser`（带 access token，10 秒超时，不跟随重定向），回应里的用户 ARN、AWS 账号 ID、用户名、邮箱、账号名用来填令牌没给的字段，令牌给了的不覆盖。这两处我都没有在真实租户上见过：不带令牌问反馈者的租户，任何路径都是同一个 401，证明不了这个接口存在。所以它失败、回的不是 JSON、或字段不像样时登录照常完成，和没问一样；账号 ID 和用户 ARN 都已经有了（包括续期时账号记录里已有）就不再问。都读不到时账号名用租户的主机名，AWS 账号 ID 留空，这时额度查询多半查不到，对话不受影响。对话的 WebSocket 先问租户的 `/v1/discovery`，拨它给的 cell 地址（桌面端也是这样），问不到或拨不通就拨租户地址；账号 API 走租户地址上的 `/accounts/<AWS 账号 ID>/invocations/rpc`。这一整条线路我没有真实账号，只对 `test/organization.test.mjs` 里的模拟租户验证过。 Gateway 上的对话连接和账号接口、节点查询一样带 access token（它被 Gateway 接受这一点有依据：反馈者的 access token 在 user-info 上得到的是 404，而不带令牌或令牌不对时是 401）；令牌回应里同时有 id_token 时也不用它，App Integrations 线路照旧先用 id_token。
 - 会话标识：除了 Magpie 的 `chat.headers` 和 Claude Code、Codex 自己的标识，这些请求头也当作会话 ID：`x-magpie-session`、`session_id`、`session-id`、`x-session-id`、`x-session-affinity`、`x-thread-id`、`x-conversation-id`、`conversation_id`。会话 ID 只用来把不同的对话分开（开头相同的两个对话不会接到同一个线程上），接续仍然要求历史前缀一致。每个请求都变的头（如 `x-client-request-id`）不算，否则每个请求都会开新线程。
 - 线程复用：Magpie 通过 `chat.headers` 钩子把会话 ID 带给插件；同一账号、同一会话、历史前缀一致的请求会接到上一轮的服务端线程上，只发新增消息，系统提示词没变也不重发。历史被改写（压缩、回退）或线程缓存过期（内存里保留 6 小时）时，开新线程重发全部历史。
 - 64 KB 消息上限：我用真实账号测过，Amazon Quick 按消息 JSON 的 UTF-8 字节数计算（中文每个字 3 字节，系统提示词和正文算在一起），65250 字节能发，65300 字节被拒，所以默认按 63000 字节控制。超出时按这个顺序处理，直到放得下：工具说明逐级缩短（完整定义 → 一行签名，描述 160 字 → 60 字 → 不带描述 → 只列工具名）→ 缩短系统提示词 → 过长的对话内容转附件 → 截断较早的内容。工具再多也不会把超限的消息发出去；万一 Amazon Quick 仍然拒收，会自动缩小到 70% 再发一次。实在放不下（比如把 `max_frame_bytes` 设得很小）时直接在本地报错，不发送。附件经 Amazon Quick 的上传接口和 DLP 检查后挂到线程上，由模型用它自己的文件工具读取。
@@ -184,6 +184,6 @@ m provider test aws-quick
 - 内容转成附件后，模型要先用它自己的文件工具读取，这一轮会慢一些。
 - 线程缓存在插件进程的内存里，Magpie 重启后下一次请求会重发全部历史。
 - 工具桥接是文本协议，模型偶尔可能不遵守；回复以 `{`、`[` 或反引号开头时会先整段缓冲，以判断它是不是一个没带标记的工具调用。
-- 代理：按 Magpie 的文档，插件用 `fetch` 发出的请求（登录、续期）走 Magpie 给供应商或账号设置的代理。聊天用的是 WebSocket，它是否也走这个代理没有验证过；需要时用 `proxy` 选项明确指定（如 `http://127.0.0.1:7890`）。
+- 代理：Magpie 会给插件的 `fetch`（登录、续期、查额度）自动加上它的代理，但不管 WebSocket，Bun 的 WebSocket 自己也不读代理环境变量（Bun 1.3.11 和 1.4.5 上实测），所以 0.3.11 及之前登录走代理、聊天直连。现在没填 `proxy` 时，聊天连接读环境变量：先 `MAGPIE_HTTPS_PROXY` / `MAGPIE_ALL_PROXY`（Magpie 把“设置”里的全局代理以这组名字传给插件，实测；SOCKS 代理它会先转成 HTTP 地址），再 `HTTPS_PROXY` / `ALL_PROXY`，大小写都认；`MAGPIE_NO_PROXY` / `NO_PROXY` 里的主机和本机地址不走代理；不是 `http://` 或 `https://` 的代理地址跳过。限制有三条：Magpie 里给单个供应商或账号设的代理不在环境变量里，聊天连接拿不到，要在 `proxy` 选项里再填一次；供应商在 Magpie 里设成“直连”而全局有代理时，把 `proxy` 填成 `direct`；本机 API 用 Node 运行时，Node 的 WebSocket 不接受代理参数，`proxy` 选项和上面这些变量都不起作用，要用 `NODE_USE_ENV_PROXY=1 HTTPS_PROXY=…` 启动它（Node 24 实测）。经过真实代理连 Amazon Quick 我没有测过，只用本地的模拟代理测过。
 - OpenCode 2.x 的入口（`opencode2.mjs`）只通过了 Magpie 社区仓库的检查脚本，没有在 OpenCode 2.x 里实际运行过。
 - 上游接口可能随官方客户端更新而变化；登录或聊天失败时先重新登录，必要时调整 `app_version`。

@@ -449,3 +449,52 @@ describe("fitting a message", () => {
     expect(out.json).toBeGreaterThan(60_000)
   })
 })
+
+describe("the proxy of a chat WebSocket", () => {
+  const { proxyFor } = _internal.upstream
+  const WSS = "wss://t1.us-east-1.enterprise.quick.aws.com/ws"
+  const P = "http://127.0.0.1:7890"
+
+  test("the proxy option comes first, and \"direct\" is none", () => {
+    const env = { MAGPIE_HTTPS_PROXY: P, HTTPS_PROXY: P }
+    expect(proxyFor(WSS, { proxy: "http://10.0.0.1:3128" }, env)).toBe("http://10.0.0.1:3128")
+    expect(proxyFor("ws://127.0.0.1:9/ws", { proxy: "http://10.0.0.1:3128" }, env)).toBe("http://10.0.0.1:3128")
+    for (const none of ["direct", "DIRECT", "none", "off"]) expect(proxyFor(WSS, { proxy: none }, env)).toBe("")
+  })
+
+  test("with no option, the one of the environment", () => {
+    expect(proxyFor(WSS, {}, {})).toBe("")
+    expect(proxyFor(WSS, { proxy: "" }, { MAGPIE_HTTPS_PROXY: P })).toBe(P)
+    expect(proxyFor(WSS, {}, { MAGPIE_https_proxy: P })).toBe(P)
+    expect(proxyFor(WSS, {}, { HTTPS_PROXY: P })).toBe(P)
+    expect(proxyFor(WSS, {}, { https_proxy: P })).toBe(P)
+    expect(proxyFor(WSS, {}, { MAGPIE_ALL_PROXY: P })).toBe(P)
+    expect(proxyFor(WSS, {}, { all_proxy: P })).toBe(P)
+    // Magpie's before the plain one, the scheme's before ALL_PROXY
+    expect(proxyFor(WSS, {}, { MAGPIE_HTTPS_PROXY: P, HTTPS_PROXY: "http://other:1" })).toBe(P)
+    expect(proxyFor(WSS, {}, { HTTPS_PROXY: P, MAGPIE_ALL_PROXY: "http://other:1" })).toBe(P)
+    // wss:// takes the https one, ws:// the http one
+    expect(proxyFor(WSS, {}, { MAGPIE_HTTP_PROXY: P })).toBe("")
+    expect(proxyFor("ws://tenant.example/ws", {}, { MAGPIE_HTTP_PROXY: P, MAGPIE_HTTPS_PROXY: "http://other:1" })).toBe(P)
+    expect(proxyFor(WSS, {}, { HTTPS_PROXY: "https://user:pw@proxy.example:8443" })).toBe("https://user:pw@proxy.example:8443")
+  })
+
+  test("a proxy Bun's WebSocket can't take is passed over", () => {
+    expect(proxyFor(WSS, {}, { HTTPS_PROXY: "socks5://127.0.0.1:1080" })).toBe("")
+    expect(proxyFor(WSS, {}, { HTTPS_PROXY: "socks5://127.0.0.1:1080", ALL_PROXY: P })).toBe(P)
+    expect(proxyFor(WSS, {}, { HTTPS_PROXY: "127.0.0.1:7890" })).toBe("")
+    expect(proxyFor("not a url", {}, { HTTPS_PROXY: P })).toBe("")
+  })
+
+  test("loopback and the hosts of NO_PROXY go around it", () => {
+    const env = { MAGPIE_HTTP_PROXY: P, MAGPIE_HTTPS_PROXY: P }
+    for (const url of ["ws://127.0.0.1:8080/ws", "ws://localhost:8080/ws", "ws://[::1]:8080/ws", "wss://api.localhost/ws"]) expect(proxyFor(url, {}, env)).toBe("")
+    expect(proxyFor(WSS, {}, { ...env, MAGPIE_NO_PROXY: "localhost,127.0.0.1,::1" })).toBe(P)
+    expect(proxyFor(WSS, {}, { ...env, MAGPIE_NO_PROXY: "quick.aws.com" })).toBe("")
+    expect(proxyFor(WSS, {}, { ...env, MAGPIE_no_proxy: " .aws.com , other.example" })).toBe("")
+    expect(proxyFor(WSS, {}, { ...env, NO_PROXY: "*.quick.aws.com" })).toBe("")
+    expect(proxyFor(WSS, {}, { ...env, no_proxy: "*" })).toBe("")
+    expect(proxyFor(WSS, {}, { ...env, NO_PROXY: "aws.co,uick.aws.com" })).toBe(P)
+    expect(proxyFor(WSS, {}, { ...env, NO_PROXY: "T1.US-EAST-1.ENTERPRISE.QUICK.AWS.COM" })).toBe("")
+  })
+})

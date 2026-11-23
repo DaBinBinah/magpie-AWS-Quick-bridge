@@ -3,6 +3,7 @@
 // tenant's cell.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
+import net from "node:net"
 import { chatCompletions } from "../plugin/chat.mjs"
 import * as oauth from "../plugin/oauth.mjs"
 import * as qbs from "../plugin/qbs.mjs"
@@ -22,6 +23,9 @@ const state = {
   dials: [], // the Host of every WebSocket opened
   frames: [], // every frame received
   accounts: [], // the account of every account API call
+  userInfo: null, // what user-info answers; null as the Gateway, with no such operation
+  currentUser: null, // what the tenant's "current user" answers; null for no such call
+  refuseChat: 0, // the status the chat upgrade is turned away with
 }
 let server
 let base
@@ -58,12 +62,18 @@ beforeAll(() => {
         // as the Gateway: no operation is bound to an App Integrations path
         case "/integration/quick-work/user-info":
           if (!signedIn(req)) return refused()
+          if (state.userInfo) return Response.json(state.userInfo)
           return new Response("<UnknownOperationException/>", { status: 404, headers: { "content-type": "application/xml" } })
+        case "/identityservice/users/currentUser":
+          if (!signedIn(req)) return refused()
+          if (state.currentUser) return typeof state.currentUser === "string" ? new Response(state.currentUser) : Response.json(state.currentUser)
+          break
         case "/v1/discovery":
           if (!signedIn(req)) return refused()
           return state.cellHost ? Response.json({ cell: "cell-1", cellHost: state.cellHost }) : new Response("not found", { status: 404 })
         case WS_PATH:
           if (!signedIn(req)) return refused()
+          if (state.refuseChat) return new Response("no", { status: state.refuseChat })
           state.dials.push(req.headers.get("host"))
           if (srv.upgrade(req)) return
           return new Response("WebSocket upgrade required", { status: 400 })
@@ -91,9 +101,9 @@ beforeAll(() => {
 afterAll(() => server.stop(true))
 
 // Signs in the way the plugin does, the account type picked being `provider`.
-async function signIn(provider = "enterprise") {
+async function signIn(provider = "enterprise", named = {}) {
   const flow = new oauth.LoginFlow({ provider, stage: "prod", region: "", port: 18080, appVersion: "1" })
-  const discovered = new URLSearchParams({ nonce: flow.nonce, authEndpoint: base + "/oauth2/authorize", tokenEndpoint: base + "/oauth2/token", tenantUrl: base, clientId: "corp-client" })
+  const discovered = new URLSearchParams({ nonce: flow.nonce, authEndpoint: base + "/oauth2/authorize", tokenEndpoint: base + "/oauth2/token", tenantUrl: base, clientId: "corp-client", ...named })
   const granted = await fetch(await flow.processDiscovery(discovered), { redirect: "manual" })
   return flow.complete(new URL(granted.headers.get("location")).searchParams)
 }
@@ -234,5 +244,191 @@ describe("an organization's tenant on the Gateway", () => {
     state.dials.length = 0
     await ask(account)
     expect(state.dials).toEqual([`localhost:${server.port}`])
+  })
+})
+
+describe("who a Gateway account is", () => {
+  const CURRENT = "/identityservice/users/currentUser"
+  const reset = () => {
+    state.claims = state.userInfo = state.currentUser = null
+    state.asked.length = state.accounts.length = 0
+  }
+
+  test("what the tokens leave out is asked of the tenant's current user", async () => {
+    reset()
+    state.currentUser = { user_info: { quicksight_external_user_arn: ARN, aws_account_id: "123456789012", user_name: "ada", account_name: "corp" } }
+    const account = await signIn("enterprise")
+    expect(account).toMatchObject({ quickProvider: "gateway", accountId: "ada", actorArn: ARN, awsAccountId: "123456789012", accountName: "corp" })
+    // the account API is addressed by that AWS account
+    await qbs.usage(account)
+    expect(state.accounts).toEqual(["123456789012"])
+
+    // renewed, it is known already and not asked again, even of a tenant that stopped answering
+    state.currentUser = null
+    state.asked.length = 0
+    expect(await oauth.refresh(account)).toMatchObject({ accountId: "ada", actorArn: ARN, awsAccountId: "123456789012", accountName: "corp" })
+    expect(state.asked).toEqual(["/oauth2/token"])
+  })
+
+  test("the answer is read in the shapes it may come in", async () => {
+    for (const answer of [
+      { userInfo: { userArn: ARN, awsAccountId: "123456789012", email: "ada@corp.example" } },
+      { user: { user_arn: ARN, emailAddress: "ada@corp.example" } }, // the AWS account read off the ARN
+      { quicksightExternalUserArn: ARN, aws_account_id: "123456789012", email: "ada@corp.example" },
+    ]) {
+      reset()
+      state.currentUser = answer
+      expect(await signIn("gateway")).toMatchObject({ accountId: "ada@corp.example", actorArn: ARN, awsAccountId: "123456789012" })
+    }
+  })
+
+  test("what the tokens say stands, and an account they name in full is not asked", async () => {
+    reset()
+    state.claims = { sub: ARN, email: "ada@corp.example" }
+    state.currentUser = { user_arn: "arn:aws:quicksight:us-east-1:999999999999:user/default/eve", aws_account_id: "999999999999", email: "eve@corp.example" }
+    expect(await signIn("gateway")).toMatchObject({ accountId: "ada@corp.example", actorArn: ARN, awsAccountId: "123456789012" })
+    expect(state.asked).not.toContain(CURRENT)
+
+    // one they name in part is asked for the rest only
+    state.claims = { email: "ada@corp.example" }
+    expect(await signIn("gateway")).toMatchObject({ accountId: "ada@corp.example", email: "ada@corp.example", awsAccountId: "999999999999" })
+    expect(state.asked).toContain(CURRENT)
+  })
+
+  test("the AWS account the sign-in page names is kept", async () => {
+    reset()
+    const account = await signIn("enterprise", { account: "210987654321" })
+    expect(state.asked).toContain(CURRENT)
+    expect(account).toMatchObject({ quickProvider: "gateway", accountId: "127.0.0.1", awsAccountId: "210987654321", actorArn: "" })
+    await qbs.usage(account)
+    expect(state.accounts).toEqual(["210987654321"])
+    expect(await oauth.refresh(account)).toMatchObject({ awsAccountId: "210987654321" })
+    // anything that is no AWS account is not taken for one
+    expect(await signIn("enterprise", { account: "default" })).toMatchObject({ awsAccountId: "" })
+  })
+
+  test("an answer that is none leaves the sign-in as it was", async () => {
+    for (const answer of [null, "<html>sign in</html>", { user_info: { user_arn: "ada", aws_account_id: "corp" } }, { message: "Forbidden" }]) {
+      reset()
+      state.currentUser = answer
+      expect(await signIn("enterprise")).toMatchObject({ quickProvider: "gateway", accountId: "127.0.0.1", email: "", actorArn: "", awsAccountId: "" })
+    }
+    // nor does a tenant that does not answer at all fail it
+    reset()
+    const real = globalThis.fetch
+    globalThis.fetch = (url, init) => (String(url).endsWith(CURRENT) ? Promise.reject(new Error("connection refused")) : real(url, init))
+    try {
+      expect(await signIn("gateway")).toMatchObject({ quickProvider: "gateway", accountId: "127.0.0.1", awsAccountId: "" })
+    } finally {
+      globalThis.fetch = real
+    }
+  })
+
+  test("a tenant with user-info is not asked for its current user", async () => {
+    reset()
+    state.userInfo = { userInfo: { email: "ada@corp.example", userArn: ARN, awsAccountId: "123456789012" } }
+    state.currentUser = { email: "eve@corp.example" }
+    try {
+      const account = await signIn("enterprise")
+      expect(account).toMatchObject({ quickProvider: "enterprise", accountId: "ada@corp.example", awsAccountId: "123456789012", wsPath: "" })
+      expect(state.asked).toContain("/integration/quick-work/user-info")
+      expect(state.asked).not.toContain(CURRENT)
+      state.asked.length = 0
+      await oauth.refresh(account)
+      expect(state.asked).toEqual(["/oauth2/token", "/integration/quick-work/user-info"])
+    } finally {
+      reset()
+    }
+  })
+})
+
+describe("chat through a proxy", () => {
+  // An HTTP proxy that carries everything to the stand-in, whatever host it
+  // is asked for, and keeps the first line of what it was asked.
+  const asked = []
+  let proxy
+  let through
+  const saved = {}
+  const VARS = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"].flatMap((k) => [k, k.toLowerCase(), `MAGPIE_${k}`, `MAGPIE_${k.toLowerCase()}`])
+
+  beforeAll(async () => {
+    proxy = net.createServer((client) => {
+      client.on("error", () => {})
+      client.once("data", (first) => {
+        const line = first.toString("latin1").split("\r\n")[0]
+        asked.push(line)
+        const to = net.connect(server.port, "127.0.0.1", () => {
+          if (line.startsWith("CONNECT ")) client.write("HTTP/1.1 200 Connection Established\r\n\r\n")
+          else to.write(first)
+          client.pipe(to)
+          to.pipe(client)
+        })
+        to.on("error", () => client.destroy())
+      })
+    })
+    await new Promise((done) => proxy.listen(0, "127.0.0.1", done))
+    through = `http://127.0.0.1:${proxy.address().port}`
+    for (const k of VARS) {
+      saved[k] = process.env[k]
+      delete process.env[k]
+    }
+  })
+
+  afterAll(() => {
+    proxy.close()
+    for (const k of VARS) if (saved[k] === undefined) delete process.env[k]
+    else process.env[k] = saved[k]
+  })
+
+  // an account whose tenant is somewhere only the proxy reaches
+  const elsewhere = async () => {
+    state.claims = { sub: ARN, email: "ada@corp.example" }
+    state.currentUser = state.userInfo = null
+    const account = { ...(await signIn("gateway")), tenantUrl: `http://tenant.invalid:${server.port}`, wsHost: `ws://tenant.invalid:${server.port}` }
+    asked.length = state.dials.length = 0
+    return account
+  }
+
+  test("the one Magpie starts the plugin with is taken when no proxy option is given", async () => {
+    const account = await elsewhere()
+    process.env.MAGPIE_HTTP_PROXY = through
+    try {
+      const { status, body } = await ask(account)
+      expect(status).toBe(200)
+      expect(body.choices[0].message.content).toBe("pong")
+      expect(state.dials).toEqual([`tenant.invalid:${server.port}`])
+      expect(asked.some((line) => line.includes(`tenant.invalid:${server.port}`))).toBe(true)
+    } finally {
+      delete process.env.MAGPIE_HTTP_PROXY
+    }
+  })
+
+  test("with none the tenant is dialed itself, and \"direct\" goes around the one there is", async () => {
+    const account = await elsewhere()
+    expect((await ask(account)).status).not.toBe(200)
+    process.env.MAGPIE_ALL_PROXY = through
+    try {
+      const res = await chatCompletions({ body: { model: "fast", messages: [{ role: "user", content: "ping" }] }, auth: account, cfg: settings({ request_timeout: "10s", proxy: "direct" }) })
+      expect(res.status).not.toBe(200)
+    } finally {
+      delete process.env.MAGPIE_ALL_PROXY
+    }
+    expect(asked.filter((line) => line.includes(WS_PATH) || line.startsWith("CONNECT "))).toEqual([])
+  })
+
+  // a Bun that doesn't say the status of a refused upgrade is asked it over again
+  test("a refused upgrade says its status, through the proxy as the dial went", async () => {
+    const account = await elsewhere()
+    process.env.MAGPIE_HTTP_PROXY = through
+    state.refuseChat = 403
+    try {
+      const { status } = await ask(account)
+      expect(status).toBe(403)
+      expect(asked.length).toBeGreaterThan(0)
+      expect(asked.every((line) => line.includes(`tenant.invalid:${server.port}`))).toBe(true)
+    } finally {
+      state.refuseChat = 0
+      delete process.env.MAGPIE_HTTP_PROXY
+    }
   })
 })
