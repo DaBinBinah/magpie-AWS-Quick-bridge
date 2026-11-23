@@ -13,6 +13,7 @@ import { MODES, chatCompletions, mapModel } from "../plugin/chat.mjs"
 import * as oauth from "../plugin/oauth.mjs"
 import * as qbs from "../plugin/qbs.mjs"
 import { MODEL_NAMES, accountModels, models, settings } from "../plugin/settings.mjs"
+import { conversationOf } from "../plugin/threads.mjs"
 import * as anthropic from "./anthropic.mjs"
 import * as responses from "./responses.mjs"
 
@@ -96,7 +97,9 @@ export function createGateway({ apiKey, account, options = {}, log = () => {} })
         ? anthropic.toChat(body)
         : api === "responses"
           ? responses.toChat(body, request.headers)
-          : { chat: body, conversation: request.headers.get("x-aws-quick-conversation") ?? request.headers.get("x-thread-id") ?? request.headers.get("session_id") ?? "" }
+          : { chat: body }
+    // what the API itself names the conversation by comes first
+    req.conversation ||= conversationOf(request.headers)
     req.chat.model = quickModel(req.chat.model, cfg.defaultModel)
     log(`${api} ${req.chat.model}${req.chat.stream ? " stream" : ""}`)
     const ask = (auth) => chatCompletions({ body: req.chat, auth, cfg, signal: request.signal, conversation: String(req.conversation).slice(0, 256) })

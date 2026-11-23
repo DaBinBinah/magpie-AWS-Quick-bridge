@@ -249,6 +249,33 @@ describe("oauth", () => {
 describe("requests", () => {
   const cfg = settings({})
 
+  test("the device id sent is the account's, an outpost_id set by hand, or none", () => {
+    const id = "0b9d4c1e-6a55-4f0e-9d0a-3c1f2e4a5b6c"
+    const account = { idToken: "x", wsHost: "h", quickProvider: "social", deviceId: id }
+    const sent = (auth, options) => _internal.upstream.sessionFromAuth(auth, settings(options)).outpostId
+    expect(sent(account, {})).toBe(id)
+    expect(sent(account, { outpost_id: "mine" })).toBe("mine")
+    expect(sent(account, { stable_device_id: false })).toBe("")
+    expect(sent({ ...account, deviceId: "not-an-id" }, {})).toBe("")
+    expect(sent({ ...account, deviceId: undefined }, {})).toBe("")
+    // a Gateway session names itself by this id: it stays as it was
+    expect(sent({ ...account, quickProvider: "gateway" }, {})).toBe("")
+    expect(_internal.upstream.dialInfo(_internal.upstream.sessionFromAuth(account, cfg)).headers["X-Outpost-Id"]).toBe(id)
+  })
+
+  test("the conversation is the one a session header names", () => {
+    const of = (headers) => _internal.threads.conversationOf(new Headers(headers))
+    expect(of({})).toBe("")
+    expect(of({ "x-request-id": "r1", "x-client-request-id": "r2" })).toBe("")
+    for (const name of ["x-aws-quick-conversation", "x-magpie-session", "session_id", "session-id", "x-session-id", "x-session-affinity", "x-thread-id", "x-conversation-id", "conversation_id"])
+      expect(of({ [name]: " s1 " })).toBe("s1")
+    // magpie's own comes first, an empty one is passed over
+    expect(of({ "x-thread-id": "t", "x-aws-quick-conversation": "c" })).toBe("c")
+    expect(of({ "x-magpie-session": "", "x-session-id": "s" })).toBe("s")
+    expect(of({ "x-session-id": "s".repeat(400) })).toHaveLength(256)
+    expect(_internal.threads.conversationOf(undefined)).toBe("")
+  })
+
   test("options have their defaults", () => {
     expect(cfg).toMatchObject({ appVersion: "1.2.4660", surface: "QUICK_WORK_DESKTOP_WINDOWS", callbackPort: 18080, requestTimeoutMs: 300000, keepaliveMs: 25000, defaultModel: "smart" })
     expect(settings({ request_timeout: "90s", callback_port: 19000, thinking_effort: "HIGH", default_model: "fast" })).toMatchObject({

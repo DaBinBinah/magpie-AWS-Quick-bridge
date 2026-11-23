@@ -25,6 +25,8 @@ export function settings(options = {}) {
     appVersion: text(options.app_version, "1.2.4660"),
     surface: text(options.surface, "QUICK_WORK_DESKTOP_WINDOWS"),
     outpostId: text(options.outpost_id),
+    // without an outpost_id the account's own device id is sent; false sends none
+    stableDeviceId: options.stable_device_id !== false,
     workingSessionId: text(options.working_session_id),
     timezone: text(options.timezone, "UTC"),
     locale: text(options.locale, "en-US"),

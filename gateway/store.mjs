@@ -63,6 +63,14 @@ export function saveConfig(patch) {
 export const newKey = () => saveConfig({ apiKey: "sk-quick-" + randomBytes(24).toString("hex") }).apiKey
 
 export const saveAccount = (auth) => write("account.json", auth)
+
+// Saves the account a sign-in ended with. The same account signing in again
+// keeps the device id it had.
+export function signedIn(fields) {
+  const was = read("account.json")
+  const same = was?.deviceId && was.accountId === fields.accountId && was.tenantUrl === fields.tenantUrl
+  saveAccount({ ...fields, ...(same ? { deviceId: was.deviceId } : {}), type: "oauth" })
+}
 export const removeAccount = () => rmSync(file("account.json"), { force: true })
 export const accountFile = () => file("account.json")
 

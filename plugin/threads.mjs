@@ -11,6 +11,22 @@ import { contentText } from "./messages.mjs"
 const MAX_THREADS = 300
 const TTL_MS = 6 * 3600_000
 
+// The headers a client names its conversation in: magpie's own two, Codex's,
+// and the ones other OpenAI clients send for session affinity. A header that
+// changes with every request is not among them: it would give each request
+// a thread of its own.
+const CONVERSATION_HEADERS = ["x-aws-quick-conversation", "x-magpie-session", "session_id", "session-id", "x-session-id", "x-session-affinity", "x-thread-id", "x-conversation-id", "conversation_id"]
+
+// The caller's id for the conversation a request belongs to, "" when its
+// headers name none.
+export function conversationOf(headers) {
+  for (const name of CONVERSATION_HEADERS) {
+    const value = String(headers?.get?.(name) ?? "").trim()
+    if (value) return value.slice(0, 256)
+  }
+  return ""
+}
+
 export const digest = (text) => createHash("sha256").update(String(text)).digest("hex").slice(0, 24)
 
 const roleOf = (m) => String(m?.role ?? "user").trim().toLowerCase() || "user"

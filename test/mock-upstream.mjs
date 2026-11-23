@@ -15,6 +15,8 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
     codes: new Map(), // code -> code_challenge
     refreshes: 0,
     turns: [], // every user_message payload received
+    dials: [], // the outpostId in the address of every WebSocket opened
+    connects: [], // every session_connect payload received
     custom: new Map(), // thread_id -> the custom_prompt it was last given
     uploads: [], // { name, contentType, size, text, thread }
     settings: { advanced_mode_enabled: false, model_slots: {} },
@@ -152,6 +154,7 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
         case "/streaming/quickwork-chat-bidirectional-stream": {
           const token = url.searchParams.get("token") ?? ""
           if (!token || token === state.rejectToken) return new Response("unauthorized", { status: 401 })
+          state.dials.push(url.searchParams.get("outpostId") ?? "")
           if (srv.upgrade(req, { data: {} })) return
           return new Response("expected a WebSocket", { status: 400 })
         }
@@ -180,6 +183,7 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
           return
         }
         if (event.type === "ping") state.pings++
+        if (event.type === "session_connect") state.connects.push(event.payload)
         // as Amazon Quick: a turn told to stop ends with what it had written
         if (event.type === "stop_generation") {
           state.stops.push(event.payload?.thread_id)

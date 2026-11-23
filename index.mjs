@@ -184,7 +184,7 @@ const server = async (input, options) => {
               auth,
               cfg: cfg(),
               signal: init?.signal ?? (request instanceof Request ? request.signal : undefined),
-              conversation: headers.get(CONVERSATION) ?? headers.get("x-thread-id") ?? "",
+              conversation: threads.conversationOf(headers),
             })
           },
         }

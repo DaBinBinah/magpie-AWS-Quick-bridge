@@ -6,7 +6,7 @@
 // naming the same thread_id.
 
 import { argumentString, callId, titleFor, uuid } from "./messages.mjs"
-import { GATEWAY_WS_PATH } from "./oauth.mjs"
+import { GATEWAY_WS_PATH, isDeviceId } from "./oauth.mjs"
 import { aidpDecode, aidpEncode, gatewayDecode, gatewayEncode, isGatewayProvider } from "./wire.mjs"
 
 const DEFAULT_WS_PATH = "/streaming/quickwork-chat-bidirectional-stream"
@@ -78,6 +78,8 @@ export const encodeFrame = (gateway, value) => (gateway ? gatewayEncode(JSON.str
 
 // The account fields the transport needs, merged with handshake defaults.
 export function sessionFromAuth(auth, cfg) {
+  // a Gateway session names itself by this id, so it is left as it was
+  const device = cfg.stableDeviceId && !isGatewayProvider(auth?.quickProvider) && isDeviceId(auth?.deviceId) ? auth.deviceId : ""
   return {
     jwt: auth?.idToken || auth?.access || "",
     wsHost: auth?.wsHost ?? "",
@@ -85,7 +87,7 @@ export function sessionFromAuth(auth, cfg) {
     provider: auth?.quickProvider ?? "social",
     actorArn: auth?.actorArn ?? "",
     surface: cfg.surface,
-    outpostId: cfg.outpostId,
+    outpostId: cfg.outpostId || device,
     workingSessionId: cfg.workingSessionId,
   }
 }

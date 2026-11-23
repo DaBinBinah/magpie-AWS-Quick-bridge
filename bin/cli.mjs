@@ -109,7 +109,7 @@ async function login(flags) {
   clearInterval(alive)
   if (result?.type !== "success") throw new Error(result?.error ?? "the sign-in failed")
   const { type: _type, ...fields } = result
-  store.saveAccount({ ...fields, type: "oauth" })
+  store.signedIn(fields)
   console.log(`Signed in as ${fields.accountId || "your account"}.\nNext: ${NAME} serve`)
 }
 

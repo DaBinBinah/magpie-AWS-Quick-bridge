@@ -115,6 +115,35 @@ describe("the gateway", () => {
     const streamed = await events(await call("/chat/completions", { ...body, stream: true }))
     expect(streamed.map(([, e]) => e.choices?.[0]?.delta?.content ?? "").join("")).toBe("pong from fast")
   })
+
+  test("the session is opened with the account's device id", async () => {
+    const id = account.peek().deviceId
+    expect(oauth.isDeviceId(id)).toBe(true)
+    await call("/v1/chat/completions", { model: "fast", messages: [{ role: "user", content: "ping" }] })
+    expect(mock.state.dials.at(-1)).toBe(id)
+    expect(mock.state.connects.at(-1).outpostId).toBe(id)
+  })
+
+  test("the same account signing in again keeps its device id, another account gets its own", () => {
+    const was = JSON.parse(readFileSync(join(dir, "account.json"), "utf8"))
+    const again = { ...was, deviceId: "11111111-2222-4333-8444-555555555555", access: "access-new" }
+    store.signedIn(again)
+    expect(account.peek()).toMatchObject({ deviceId: was.deviceId, access: "access-new", type: "oauth" })
+    store.signedIn({ ...again, accountId: "grace@example.com" })
+    expect(account.peek().deviceId).toBe(again.deviceId)
+    store.saveAccount(was)
+  })
+
+  test("a session header (OpenCode's x-session-affinity) names the conversation", async () => {
+    const hi = { role: "user", content: "one opening line" }
+    const next = [hi, { role: "assistant", content: "x" }, { role: "user", content: "and then" }]
+    await call("/v1/chat/completions", { model: "smart", messages: [hi] }, { "x-session-affinity": "ses_a" })
+    const a = mock.state.turns.at(-1).thread_id
+    await call("/v1/chat/completions", { model: "smart", messages: next }, { "x-session-id": "ses_b" })
+    expect(mock.state.turns.at(-1).thread_id).not.toBe(a)
+    await call("/v1/chat/completions", { model: "smart", messages: next }, { "x-session-affinity": "ses_a" })
+    expect(mock.state.turns.at(-1)).toMatchObject({ thread_id: a, text: "and then" })
+  })
 })
 
 describe("Anthropic Messages (Claude Code)", () => {

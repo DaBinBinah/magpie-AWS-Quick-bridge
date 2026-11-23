@@ -83,6 +83,8 @@ describe("sign-in", () => {
       tokenEndpoint: mock.url + "/token",
     })
     expect(auth.expires).toBeGreaterThan(Date.now() + 3000_000)
+    // the account's own device id, as the desktop app has one
+    expect(auth.deviceId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
     auth = { ...auth, type: "oauth" }
   })
 
@@ -109,6 +111,10 @@ describe("chat", () => {
     const turn = mock.state.turns.at(-1)
     expect(turn).toMatchObject({ text: "ping", agent_mode: "fast", send_origin: "programmatic", appVersion: "1.2.4660", user_timezone: "UTC" })
     expect(turn.custom_prompt).toStartWith("Be brief.\n\nNote from the user:")
+    // the account's device id is what the session is opened with
+    expect(mock.state.dials.at(-1)).toBe(auth.deviceId)
+    expect(mock.state.connects.at(-1)).toMatchObject({ outpostId: auth.deviceId, surfaceType: "QUICK_WORK_DESKTOP_WINDOWS" })
+    expect(turn.outpostId).toBe(auth.deviceId)
     // Amazon Quick's app markup is asked to stay out of an agent's screen
     expect(turn.custom_prompt).toEndWith(_internal.messages.PLAIN_TEXT_NOTE)
     expect(turn.system_prompt).toBeUndefined()
@@ -393,6 +399,20 @@ describe("a conversation over several requests", () => {
     expect(turn.text).toBe("User: something else\n\nAssistant: x\n\nUser: more")
   })
 
+  test("a client's own session header keeps its conversations apart", async () => {
+    const hi = { role: "user", content: "the same opening line" }
+    const next = [hi, { role: "assistant", content: "x" }, { role: "user", content: "and then" }]
+    await post({ model: "smart", messages: [hi] }, { headers: { "x-session-affinity": "ses_a" } })
+    const a = mock.state.turns.at(-1).thread_id
+    // the same words in another session are another thread, sent whole
+    await post({ model: "smart", messages: next }, { headers: { "x-magpie-session": "ses_b" } })
+    expect(mock.state.turns.at(-1).thread_id).not.toBe(a)
+    expect(mock.state.turns.at(-1).text).toBe("User: the same opening line\n\nAssistant: x\n\nUser: and then")
+    // in its own session it goes on in its thread
+    await post({ model: "smart", messages: next }, { headers: { "x-session-affinity": "ses_a" } })
+    expect(mock.state.turns.at(-1)).toMatchObject({ thread_id: a, text: "and then" })
+  })
+
   test("what does not fit a 64 KB frame: schemas become signatures, long text an attachment", async () => {
     const tool = (i) => ({ type: "function", function: { name: `tool_${i}`, description: "d".repeat(900), parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } } })
     const big = Array.from({ length: 80 }, (_, i) => tool(i))
@@ -503,8 +523,20 @@ describe("the account", () => {
 describe("renewal", () => {
   test("magpie's refresh hook returns the renewed fields", async () => {
     const next = await hooks.auth.refresh(auth)
-    expect(next).toMatchObject({ access: "access-1", refresh: "refresh-1", accountId: "ada@example.com", clientId: "mock-client" })
+    expect(next).toMatchObject({ access: "access-1", refresh: "refresh-1", accountId: "ada@example.com", clientId: "mock-client", deviceId: auth.deviceId })
     expect(next.expires).toBeGreaterThan(Date.now())
+  })
+
+  test("an account from before there were device ids sends none, and gets one with its renewal", async () => {
+    const { deviceId: _id, ...old } = auth
+    const { fetch: send, baseURL } = await hooks.auth.loader(async () => old)
+    await send(`${baseURL}/chat/completions`, { method: "POST", body: JSON.stringify({ model: "smart", messages: [{ role: "user", content: "ping" }] }) })
+    expect(mock.state.dials.at(-1)).toBe("")
+    expect(mock.state.connects.at(-1).outpostId).toBe("")
+    const next = await hooks.auth.refresh(old)
+    expect(_internal.oauth.isDeviceId(next.deviceId)).toBe(true)
+    expect(next.deviceId).not.toBe(auth.deviceId)
+    expect((await hooks.auth.refresh({ ...old, ...next })).deviceId).toBe(next.deviceId)
   })
 
   test("a refused refresh token asks for a new sign-in", async () => {

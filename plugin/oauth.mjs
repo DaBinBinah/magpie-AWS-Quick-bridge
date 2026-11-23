@@ -2,7 +2,7 @@
 // aws-quickwork-2api's internal/oauth. Nothing here needs the official
 // desktop app.
 
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 
 export const GATEWAY_WS_PATH = "/ws/service/SpaceNeedleConversationService/operation/ChatBidirectionalStream"
 const ENTERPRISE_SCOPE = "openid profile email"
@@ -215,6 +215,9 @@ async function fetchUserInfo(provider, stage, tenantUrl, accessToken) {
 
 const prefer = (value, fallback) => (String(value ?? "").trim() ? value : fallback ?? "")
 
+const DEVICE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+export const isDeviceId = (value) => typeof value === "string" && DEVICE_ID.test(value)
+
 // Builds the fields saved for an account from newly obtained tokens. `base`
 // carries the account's provider, tenant URL and OAuth client.
 export function sessionFields(base, tokens, info) {
@@ -268,6 +271,10 @@ export function sessionFields(base, tokens, info) {
     idcRegion: base.idcRegion ?? "",
     tokenEndpoint: base.tokenEndpoint ?? "",
     redirectUri: base.redirectUri ?? "",
+    // What the desktop app calls its device id, sent as outpostId. An
+    // account gets one when it signs in, or with its next renewal when it
+    // signed in before there was one, and keeps it from then on.
+    deviceId: isDeviceId(base.deviceId) ? base.deviceId : randomUUID(),
   }
 }
 
