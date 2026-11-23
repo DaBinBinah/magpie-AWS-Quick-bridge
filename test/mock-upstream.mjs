@@ -25,6 +25,7 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
     delayMs: 0, // how long a reply is held back, as a model that thinks
     idleMs: 0, // as Amazon Quick's 95 s: a client silent this long is dropped with IDLE_TIMEOUT (0: never)
     pings: 0, // the ping messages received
+    usage: null, // what profile/usage answers instead of an account with plenty left
   }
 
   const frame = (event) =>
@@ -125,7 +126,7 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
           const answer = (value) =>
             Response.json({ eventType: "invokeAgent", eventResponse: { invokeAgentResponse: JSON.stringify({ type: "api_response", status: 200, body: value, body_encoding: "json" }) } })
           if (path === "profile/usage")
-            return answer({
+            return answer(state.usage ?? {
               session: { used: 3, limit: 100, label: "Session usage", percent: 3, resume_in_minutes: 0 },
               monthly: { used: 17, limit: 600, label: "Monthly usage", percent: 2, resets_at: 1796083200 },
               subscription: { subscription_type: "QUICK_LITE_FREE_TRIAL", free_trial_metadata: { status: "ACTIVE", expiry_date: 1797688435 } },

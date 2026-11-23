@@ -121,6 +121,36 @@ export function usageFromProfile(raw, auth) {
 
 export const usage = async (auth, opts) => usageFromProfile(await invoke(auth, "profile/usage", "GET", {}, opts), auth)
 
+// The allowance of profile/usage that is used up, and the seconds until it
+// is there again (0 when Amazon Quick doesn't say); null when none is. A
+// month that is used up still runs while its overage has room.
+export function spentAllowance(raw, now = Date.now()) {
+  const spent = (q) => {
+    if (!q || typeof q !== "object") return false
+    const limit = Number(q.limit) || 0
+    return limit > 0 ? Number(q.used) >= limit : Number(q.percent) >= 100
+  }
+  const secs = (q) => {
+    const at = Date.parse(isoTime(q.resets_at))
+    if (Number.isFinite(at)) return Math.max(0, Math.ceil((at - now) / 1000))
+    return Number(q.resume_in_minutes) > 0 ? Math.round(Number(q.resume_in_minutes) * 60) : 0
+  }
+  const found = []
+  if (spent(raw?.session)) found.push({ name: "session", secs: secs(raw.session) })
+  const overage = raw?.overage_monthly
+  if (spent(raw?.monthly) && !(Number(overage?.limit) > 0 && !spent(overage))) found.push({ name: "monthly", secs: secs(raw.monthly) })
+  return found.sort((a, b) => b.secs - a.secs)[0] ?? null
+}
+
+// spentAllowance for the account, asked briefly: null when it can't be read.
+export async function spent(auth) {
+  try {
+    return spentAllowance(await invoke(auth, "profile/usage", "GET", {}, { signal: AbortSignal.timeout(5_000) }))
+  } catch {
+    return null
+  }
+}
+
 const SETTINGS_MS = 2 * 60_000
 const settingsCache = new Map()
 

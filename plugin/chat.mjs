@@ -53,8 +53,26 @@ export function errorResponse(status, code, message, headers = {}) {
 
 const THROTTLED = /thrott|rate.?limit|too many requests|quota|limit exceeded|capacity/i
 
-// The answer for a turn that failed before anything was sent.
-export function failureResponse(error) {
+// magpie rests an account for a 429's Retry-After. An allowance that is
+// away for longer is asked about again after this long, in case the plan
+// changed meanwhile.
+const REST_MAX_SECS = 6 * 3600
+
+const span = (secs) => (secs >= 5400 ? `${Math.round(secs / 3600)} hours` : `${Math.max(1, Math.round(secs / 60))} minutes`)
+
+// Whether a failed turn is one Amazon Quick refused itself, which it also
+// does when an allowance is used up, in words that are not known.
+export const refused = (error) => error instanceof UpstreamError && (error.kind === "upstream" || (error.kind === "handshake" && error.status === 429))
+
+// The answer for a turn that failed before anything was sent. `spent` is
+// the account's used-up allowance (qbs.spentAllowance), when it has one.
+export function failureResponse(error, spent = null) {
+  if (spent && refused(error)) {
+    const back = spent.secs > 0 ? `; it is back in ${span(spent.secs)}` : ""
+    return errorResponse(429, "rate_limit_exceeded", `Amazon Quick's ${spent.name} allowance is used up${back} (${error.message})`, {
+      ...(spent.secs > 0 ? { "retry-after": String(Math.min(spent.secs, REST_MAX_SECS)) } : {}),
+    })
+  }
   if (!(error instanceof UpstreamError)) return errorResponse(502, "upstream_error", String(error?.message ?? error))
   if (error.kind === "handshake" && error.status === 401)
     return errorResponse(401, "upstream_session_unavailable", `Amazon Quick refused the sign-in; sign in again (${error.message})`, {
@@ -396,6 +414,6 @@ export async function chatCompletions({ body, auth, cfg, signal, conversation = 
   } catch (e) {
     settle()
     if (signal?.aborted) throw e
-    return failureResponse(e)
+    return failureResponse(e, refused(e) ? await qbs.spent(auth) : null)
   }
 }

@@ -161,6 +161,34 @@ describe("chat", () => {
     expect(mock.state.turns.at(-1).text).toBe("ping")
   })
 
+  test("a turn refused while an allowance is used up rests the account until it is back", async () => {
+    const ask = () => post({ model: "smart", stream: true, messages: [{ role: "user", content: "ping" }] })
+    mock.state.script = () => [{ type: "error", payload: { message: "request could not be served" } }]
+    try {
+      // Amazon Quick's words for it are not known: the account's usage says it
+      mock.state.usage = { session: { used: 100, limit: 100, resume_in_minutes: 42 }, monthly: { used: 130, limit: 600, resets_at: 1796083200 } }
+      let res = await ask()
+      expect(res.status).toBe(429)
+      expect(res.headers.get("retry-after")).toBe("2520")
+      expect((await res.json()).error.message).toBe("Amazon Quick's session allowance is used up; it is back in 42 minutes (upstream error: request could not be served)")
+
+      // an allowance away for long is asked about again after six hours
+      mock.state.usage = { session: { used: 3, limit: 100 }, monthly: { used: 600, limit: 600, resets_at: Math.floor(Date.now() / 1000) + 9 * 86400 } }
+      res = await ask()
+      expect(res.status).toBe(429)
+      expect(res.headers.get("retry-after")).toBe("21600")
+      expect((await res.json()).error.message).toContain("monthly allowance is used up; it is back in 216 hours")
+
+      // with something left, the failure is what it was
+      mock.state.usage = null
+      res = await ask()
+      expect(res.status).toBe(502)
+      expect(res.headers.get("retry-after")).toBeNull()
+    } finally {
+      Object.assign(mock.state, { script: null, usage: null })
+    }
+  })
+
   test("tool_choice none turns the bridge off", async () => {
     const body = await (await post({ model: "smart", tools, tool_choice: "none", messages: [{ role: "user", content: "Please use the tool get_weather" }] })).json()
     expect(body.choices[0].message).toEqual({ role: "assistant", content: "pong from smart" })

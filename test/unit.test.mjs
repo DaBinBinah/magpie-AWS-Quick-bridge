@@ -337,6 +337,28 @@ describe("requests", () => {
     expect(() => prepare({ n: 2, messages: [{ role: "user", content: "x" }] }, cfg, "")).toThrow("n > 1")
   })
 
+  test("which allowance is used up, and for how long", () => {
+    const { spentAllowance } = _internal.qbs
+    const now = Date.parse("2026-11-23T00:00:00Z")
+    const left = { used: 3, limit: 100 }
+    expect(spentAllowance({ session: left, monthly: { used: 17, limit: 600 } }, now)).toBeNull()
+    expect(spentAllowance(null, now)).toBeNull()
+    expect(spentAllowance({ session: { used: 100, limit: 100, resume_in_minutes: 30 }, monthly: left }, now)).toEqual({ name: "session", secs: 1800 })
+    // a time to be back at, in epoch seconds or as ISO; a share when there is no limit
+    expect(spentAllowance({ monthly: { used: 601, limit: 600, resets_at: now / 1000 + 90 } }, now)).toEqual({ name: "monthly", secs: 90 })
+    expect(spentAllowance({ monthly: { percent: 100, resets_at: "2026-11-23T00:10:00Z" } }, now)).toEqual({ name: "monthly", secs: 600 })
+    // Amazon Quick doesn't say when, or says a time that passed
+    expect(spentAllowance({ session: { used: 100, limit: 100 } }, now)).toEqual({ name: "session", secs: 0 })
+    expect(spentAllowance({ monthly: { used: 600, limit: 600, resets_at: now / 1000 - 5 } }, now)).toEqual({ name: "monthly", secs: 0 })
+    // both: the one that is away longer
+    const month = { used: 600, limit: 600, resets_at: now / 1000 + 86400 }
+    expect(spentAllowance({ session: { used: 100, limit: 100, resume_in_minutes: 30 }, monthly: month }, now)).toEqual({ name: "monthly", secs: 86400 })
+    // a used-up month goes on while its overage has room
+    expect(spentAllowance({ monthly: month, overage_monthly: { used: 10, limit: 200 } }, now)).toBeNull()
+    expect(spentAllowance({ monthly: month, overage_monthly: { used: 200, limit: 200 } }, now)).toEqual({ name: "monthly", secs: 86400 })
+    expect(spentAllowance({ monthly: month, overage_monthly: { used: 0, limit: 0 } }, now)).toEqual({ name: "monthly", secs: 86400 })
+  })
+
   test("usage follows the totals Amazon Quick reports", () => {
     expect(usageBody({ prompt: 12, completion: 5, total: 20, cacheRead: 3, cacheWrite: 0 })).toEqual({
       prompt_tokens: 15,
