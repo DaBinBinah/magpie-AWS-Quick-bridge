@@ -1,7 +1,7 @@
 {
   "name": "magpie-aws-quick-bridge",
-  "version": "0.3.8",
-  "description": "Amazon Quick (QuickWork) for Claude Code, Codex and OpenCode. Works with both Magpie (provider plugin) and CC Switch (local API). 同时支持 Magpie 与 CC Switch。",
+  "version": "0.3.9",
+  "description": "AWS Quick (Amazon Quick / QuickWork) for Claude Code, Codex and OpenCode. Works with both Magpie (provider plugin) and CC Switch (local API). 同时支持 Magpie 与 CC Switch。",
   "type": "module",
   "main": "./opencode.mjs",
   "exports": {
@@ -37,6 +37,7 @@
     "quickwork",
     "magpie-AWS-Quick-bridge",
     "aws-quick",
+    "aws quick",
     "amazon",
     "quick",
     "ccswitch",
@@ -63,8 +64,8 @@
   "magpie": {
     "name": "magpie-AWS-Quick-bridge",
     "summary": {
-      "en": "Use your Amazon Quick (QuickWork) account in your coding agents. Works with both Magpie and CC Switch: browser sign-in, automatic token renewal, quota, streaming chat with thinking, tool calls. Unofficial.",
-      "zh": "把 Amazon Quick（QuickWork）账号接到你的编程 agent 上，同时支持 Magpie 和 CC Switch：浏览器登录、token 自动续期、额度显示、流式对话与思考输出、工具调用。非官方。"
+      "en": "Use your AWS Quick (Amazon Quick / QuickWork) account in your coding agents. Works with both Magpie and CC Switch: browser sign-in, automatic token renewal, quota, streaming chat with thinking, tool calls. Unofficial.",
+      "zh": "把 AWS Quick（Amazon Quick / QuickWork）账号接到你的编程 agent 上，同时支持 Magpie 和 CC Switch：浏览器登录、token 自动续期、额度显示、流式对话与思考输出、工具调用。非官方。"
     },
     "maxConcurrency": 4,
     "options": {
