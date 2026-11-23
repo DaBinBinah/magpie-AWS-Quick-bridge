@@ -147,7 +147,7 @@ async function request(endpoint, init) {
       return endpoint
     }
   })()
-  const res = await fetch(endpoint, { ...init, signal: AbortSignal.timeout(30_000) })
+  const res = await fetch(endpoint, { ...init, signal: init?.signal ?? AbortSignal.timeout(30_000) })
   const text = (await res.text()).slice(0, 1 << 20)
   if (!res.ok) throw new HTTPError(res.status, host, text.trim().slice(0, 300))
   try {
@@ -163,6 +163,40 @@ const postJSON = (endpoint, payload, headers = {}) =>
     headers: { "content-type": "application/json", accept: "application/json", ...headers },
     body: JSON.stringify(payload),
   })
+
+// What the organization's sign-in server says about itself (RFC 8414); null
+// from one that does not say.
+async function serverMetadata(authEndpoint) {
+  try {
+    return await request(`${new URL(authEndpoint).origin}/.well-known/oauth-authorization-server`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(8_000),
+    })
+  } catch {
+    return null
+  }
+}
+
+// The scopes to ask an organization's sign-in server for: the ones it lists,
+// when it lists them and has no OpenID ones.
+export function enterpriseScope(metadata) {
+  const listed = Array.isArray(metadata?.scopes_supported) ? metadata.scopes_supported.filter((s) => typeof s === "string" && s.trim()) : []
+  return listed.length && !listed.includes("openid") ? listed.join(" ") : ENTERPRISE_SCOPE
+}
+
+// The tenant as the audience of the sign-in (RFC 8707): https://<host>,
+// without a port or a path. An organization's sign-in server answers
+// "Missing or invalid resource parameter" to a request without it.
+export function resourceFor(tenantUrl) {
+  const tenant = String(tenantUrl ?? "").trim()
+  if (!tenant) return ""
+  try {
+    const u = new URL(tenant.includes("://") ? tenant : "https://" + tenant)
+    return `${u.protocol}//${u.hostname}`
+  } catch {
+    return ""
+  }
+}
 
 const postForm = (endpoint, form) =>
   request(endpoint, {
@@ -253,6 +287,8 @@ export async function refresh(auth) {
       if (!auth.tokenEndpoint) throw expired("Amazon Quick: the account has no token endpoint; sign in again")
       const form = { grant_type: "refresh_token", refresh_token: token, client_id: auth.clientId ?? "" }
       if (auth.clientSecret) form.client_secret = auth.clientSecret
+      const resource = resourceFor(auth.tenantUrl)
+      if (resource) form.resource = resource
       raw = await postForm(auth.tokenEndpoint, form)
     } else {
       const endpoint = auth.tokenEndpoint || `${oidcEndpoint(auth.idcRegion || auth.region || "us-east-1")}/token`
@@ -313,6 +349,7 @@ export class LoginFlow {
     this.discovery = null
     this.clientId = ""
     this.clientSecret = ""
+    this.resource = ""
     this.authorizeUrl = ""
     this.created = Date.now()
   }
@@ -361,16 +398,19 @@ export class LoginFlow {
         throw new StepError(400, "discovery response is missing authEndpoint/tokenEndpoint")
       this.clientId = q("clientId", "client_id")
       this.clientSecret = q("clientSecret", "client_secret")
-      this.authorizeUrl = appendQuery(this.discovery.authEndpoint, {
+      this.resource = q("resource") || resourceFor(this.discovery.tenantUrl)
+      const params = {
         response_type: "code",
         client_id: this.clientId,
         redirect_uri: this.redirectUri,
-        scope: ENTERPRISE_SCOPE,
+        scope: enterpriseScope(await serverMetadata(this.discovery.authEndpoint)),
         state: this.state,
         ...pkce,
         access_type: "offline",
         prompt: "consent",
-      })
+      }
+      if (this.resource) params.resource = this.resource
+      this.authorizeUrl = appendQuery(this.discovery.authEndpoint, params)
       return this.authorizeUrl
     }
 
@@ -422,6 +462,7 @@ export class LoginFlow {
         code_verifier: this.verifier,
       }
       if (this.clientSecret) form.client_secret = this.clientSecret
+      if (this.resource) form.resource = this.resource
       return tokensFrom(await postForm(this.discovery.tokenEndpoint, form))
     }
     return tokensFrom(

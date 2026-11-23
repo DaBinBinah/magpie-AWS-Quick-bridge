@@ -22,6 +22,9 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
     script: null, // (payload) => events[], overrides the default reply
     limit: 65_250, // the bytes of a user_message's JSON over which it is refused
     refused: [], // the size of every message refused for it
+    delayMs: 0, // how long a reply is held back, as a model that thinks
+    idleMs: 0, // as Amazon Quick's 95 s: a client silent this long is dropped with IDLE_TIMEOUT (0: never)
+    pings: 0, // the ping messages received
   }
 
   const frame = (event) =>
@@ -29,6 +32,15 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
       { ":event-type": "rawOutputEvent", ":content-type": "application/json", ":message-type": "event" },
       JSON.stringify({ payload: Buffer.from(JSON.stringify(event)).toString("base64") }),
     )
+
+  function heard(ws) {
+    clearTimeout(ws.data.idle)
+    if (!(state.idleMs > 0)) return
+    ws.data.idle = setTimeout(() => {
+      ws.send(frame({ type: "error", code: "IDLE_TIMEOUT", message: `Client sent no frames for >${state.idleMs} ms` }))
+      ws.close(1000, "Streaming completed successfully.")
+    }, state.idleMs)
+  }
 
   function reply(payload) {
     if (state.script) return state.script(payload)
@@ -138,14 +150,23 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
         case "/streaming/quickwork-chat-bidirectional-stream": {
           const token = url.searchParams.get("token") ?? ""
           if (!token || token === state.rejectToken) return new Response("unauthorized", { status: 401 })
-          if (srv.upgrade(req)) return
+          if (srv.upgrade(req, { data: {} })) return
           return new Response("expected a WebSocket", { status: 400 })
         }
       }
       return new Response("not found", { status: 404 })
     },
     websocket: {
+      open(ws) {
+        heard(ws)
+      },
+      close(ws) {
+        ws.data.closed = true
+        clearTimeout(ws.data.idle)
+      },
       message(ws, data) {
+        // only a message counts as the client being there; a WebSocket ping never gets here
+        heard(ws)
         let event
         let bytes
         try {
@@ -156,6 +177,7 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
         } catch {
           return
         }
+        if (event.type === "ping") state.pings++
         if (event.type !== "user_message") return
         // as Amazon Quick: a message whose JSON is over some 65250 bytes is
         // refused (state.limit, for a test to lower)
@@ -165,7 +187,12 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
         }
         state.turns.push(event.payload)
         if (event.payload.custom_prompt) state.custom.set(event.payload.thread_id, event.payload.custom_prompt)
-        for (const out of reply(event.payload)) ws.send(frame(out))
+        const events = reply(event.payload)
+        const answer = () => {
+          if (!ws.data.closed) for (const out of events) ws.send(frame(out))
+        }
+        if (state.delayMs > 0) setTimeout(answer, state.delayMs)
+        else answer()
       },
     },
   })

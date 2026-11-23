@@ -16,7 +16,7 @@ beforeAll(async () => {
   const client = { auth: { set: async ({ body }) => void saved.push(body) } }
   hooks = await plugin.server(
     { client, directory: "/tmp" },
-    { oidc_base: mock.url, discovery_url: mock.url + "/sn", data_plane_url: mock.url, callback_port: 0, request_timeout: "10s" },
+    { oidc_base: mock.url, discovery_url: mock.url + "/sn", data_plane_url: mock.url, callback_port: 0, request_timeout: "10s", keepalive_interval: "100ms" },
   )
 })
 
@@ -178,6 +178,18 @@ describe("chat", () => {
     const events = await sse(await post({ model: "smart", stream: true, messages: [{ role: "user", content: "ping" }] }))
     expect(events.at(-1).error.message).toContain("cut")
     mock.state.script = null
+  })
+
+  test("a reply that takes longer than Amazon Quick lets a client stay silent still arrives", async () => {
+    Object.assign(mock.state, { idleMs: 400, delayMs: 1500, pings: 0 })
+    try {
+      const res = await post({ model: "smart", messages: [{ role: "user", content: "ping" }] })
+      expect(res.status).toBe(200)
+      expect((await res.json()).choices[0].message.content).toBe("pong from smart")
+      expect(mock.state.pings).toBeGreaterThan(5)
+    } finally {
+      Object.assign(mock.state, { idleMs: 0, delayMs: 0 })
+    }
   })
 
   test("bad requests and other paths", async () => {

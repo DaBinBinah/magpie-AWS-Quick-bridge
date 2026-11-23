@@ -436,12 +436,16 @@ export function chat({ session, cfg, input, signal, onEvent }) {
         return fail(new UpstreamError("transport", `send user_message: ${e.message}`))
       }
       armIdle()
-      // keeps the socket alive while the model is thinking
+      // Amazon Quick ends a socket whose client sent no message for 95
+      // seconds (IDLE_TIMEOUT), and a WebSocket-level ping does not count:
+      // a ping message keeps a long reply alive, the WebSocket ping keeps
+      // proxies on the way from closing it.
       pingTimer = setInterval(() => {
         try {
+          send({ type: "ping", payload: { timestamp: Date.now() } })
           ws.ping?.("ping")
         } catch {}
-      }, PING_MS)
+      }, cfg.keepaliveMs > 0 ? cfg.keepaliveMs : PING_MS)
     }
 
     ws.onmessage = (event) => {

@@ -38,6 +38,8 @@ export function settings(options = {}) {
     maxFrameBytes: Number.isInteger(options.max_frame_bytes) && options.max_frame_bytes >= 0 ? options.max_frame_bytes : 63_000,
     defaultModel: mapModel(options.default_model, "smart"),
     requestTimeoutMs: durationMs(options.request_timeout, 5 * 60_000),
+    // how often a ping message is sent while a reply is awaited; Amazon Quick drops a client silent for 95 seconds
+    keepaliveMs: Math.min(durationMs(options.keepalive_interval, 25_000), 60_000),
     proxy: text(options.proxy),
     provider: oauth.normalizedProvider(options.provider),
     stage: oauth.normalizedStage(options.build_stage),

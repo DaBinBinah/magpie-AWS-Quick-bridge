@@ -159,13 +159,94 @@ describe("oauth", () => {
       expires: 2000000000000,
     })
   })
+
+  test("the tenant is the resource of an organization's sign-in, without a port or a path", () => {
+    expect(oauth.resourceFor("https://c7qdw2e3.us-east-1.enterprise.quick.aws.com/")).toBe("https://c7qdw2e3.us-east-1.enterprise.quick.aws.com")
+    expect(oauth.resourceFor("tenant.example.com:8443/path")).toBe("https://tenant.example.com")
+    expect(oauth.resourceFor("")).toBe("")
+    expect(oauth.resourceFor("https://")).toBe("")
+  })
+
+  test("the scopes asked for are the ones the sign-in server lists", () => {
+    expect(oauth.enterpriseScope({ scopes_supported: ["default", "offline_access"] })).toBe("default offline_access")
+    expect(oauth.enterpriseScope({ scopes_supported: ["openid", "email"] })).toBe("openid profile email")
+    expect(oauth.enterpriseScope({ scopes_supported: [] })).toBe("openid profile email")
+    expect(oauth.enterpriseScope(null)).toBe("openid profile email")
+  })
+
+  test("an organization's sign-in, token exchange and renewal all name the tenant", async () => {
+    const forms = []
+    let describes = true
+    const refuse = () => Response.json({ Message: "Missing or invalid resource parameter for operation: Authorize" }, { status: 400 })
+    // as an organization's Amazon Quick sign-in server: nothing works without the resource
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const url = new URL(req.url)
+        switch (url.pathname) {
+          case "/.well-known/oauth-authorization-server":
+            return describes ? Response.json({ scopes_supported: ["default", "offline_access"] }) : new Response("not found", { status: 404 })
+          case "/oauth2/authorize": {
+            if (url.searchParams.get("resource") !== "http://127.0.0.1") return refuse()
+            const to = new URL(url.searchParams.get("redirect_uri"))
+            to.searchParams.set("code", "code-" + url.searchParams.get("code_challenge"))
+            to.searchParams.set("state", url.searchParams.get("state"))
+            return Response.redirect(to.toString(), 302)
+          }
+          case "/oauth2/token": {
+            const form = Object.fromEntries(new URLSearchParams(await req.text()))
+            forms.push(form)
+            if (form.resource !== "http://127.0.0.1") return refuse()
+            return Response.json({ access_token: `access-${forms.length}`, refresh_token: `refresh-${forms.length}`, expires_in: 3600 })
+          }
+          case "/integration/quick-work/user-info":
+            return Response.json({ email: "ada@corp.example" })
+        }
+        return new Response("not found", { status: 404 })
+      },
+    })
+    try {
+      const base = `http://127.0.0.1:${server.port}`
+      const discovered = (flow) =>
+        new URLSearchParams({ nonce: flow.nonce, authEndpoint: base + "/oauth2/authorize", tokenEndpoint: base + "/oauth2/token", tenantUrl: base + "/", clientId: "corp-client" })
+      const flow = new oauth.LoginFlow({ provider: "enterprise", stage: "prod", region: "", port: 18080, appVersion: "1" })
+      const authorize = new URL(await flow.processDiscovery(discovered(flow)))
+      expect(Object.fromEntries(authorize.searchParams)).toMatchObject({
+        resource: "http://127.0.0.1",
+        scope: "default offline_access",
+        client_id: "corp-client",
+        redirect_uri: "http://localhost:18080",
+        code_challenge_method: "S256",
+      })
+
+      const granted = await fetch(authorize, { redirect: "manual" })
+      expect(granted.status).toBe(302)
+      // the flow is saved between its two steps when the address is pasted
+      const account = await oauth.LoginFlow.from(JSON.parse(JSON.stringify(flow))).complete(new URL(granted.headers.get("location")).searchParams)
+      expect(account).toMatchObject({ email: "ada@corp.example", quickProvider: "enterprise", access: "access-1", refresh: "refresh-1", tokenEndpoint: base + "/oauth2/token" })
+      expect(forms[0]).toMatchObject({ grant_type: "authorization_code", resource: "http://127.0.0.1", client_id: "corp-client", code_verifier: flow.verifier })
+
+      expect(await oauth.refresh(account)).toMatchObject({ access: "access-2", refresh: "refresh-2" })
+      expect(forms[1]).toMatchObject({ grant_type: "refresh_token", refresh_token: "refresh-1", resource: "http://127.0.0.1" })
+
+      // a sign-in server that does not describe itself is asked for the OpenID scopes
+      describes = false
+      const plain = new oauth.LoginFlow({ provider: "enterprise", stage: "prod", region: "", port: 18080, appVersion: "1" })
+      const url = new URL(await plain.processDiscovery(discovered(plain)))
+      expect(url.searchParams.get("scope")).toBe("openid profile email")
+      expect(url.searchParams.get("resource")).toBe("http://127.0.0.1")
+    } finally {
+      server.stop(true)
+    }
+  })
 })
 
 describe("requests", () => {
   const cfg = settings({})
 
   test("options have their defaults", () => {
-    expect(cfg).toMatchObject({ appVersion: "1.2.4660", surface: "QUICK_WORK_DESKTOP_WINDOWS", callbackPort: 18080, requestTimeoutMs: 300000, defaultModel: "smart" })
+    expect(cfg).toMatchObject({ appVersion: "1.2.4660", surface: "QUICK_WORK_DESKTOP_WINDOWS", callbackPort: 18080, requestTimeoutMs: 300000, keepaliveMs: 25000, defaultModel: "smart" })
     expect(settings({ request_timeout: "90s", callback_port: 19000, thinking_effort: "HIGH", default_model: "fast" })).toMatchObject({
       requestTimeoutMs: 90000,
       callbackPort: 19000,
