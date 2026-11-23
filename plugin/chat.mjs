@@ -377,6 +377,18 @@ export async function chatCompletions({ body, auth, cfg, signal, conversation = 
   const settle = () => signal?.removeEventListener("abort", onAbort)
 
   const session = sessionFromAuth(auth, cfg)
+  // a Gateway tenant's chat is dialed at its cell, and at the tenant itself
+  // when the cell is not known or does not take the connection
+  const tenantHost = session.wsHost
+  if (isGatewayProvider(session.provider)) session.wsHost = (await qbs.cellHost(auth, abort.signal).catch(() => "")) || tenantHost
+  const send = (input, onEvent) =>
+    chat({ session, cfg, input, signal: abort.signal, onEvent }).catch((e) => {
+      const refusedDial = e instanceof UpstreamError && e.kind === "handshake" && e.status !== 401 && e.status !== 403
+      if (session.wsHost === tenantHost || !refusedDial || abort.signal.aborted) throw e
+      qbs.forgetCell(auth)
+      session.wsHost = tenantHost
+      return chat({ session, cfg, input, signal: abort.signal, onEvent })
+    })
   const account = `${auth?.tenantUrl}|${auth?.accountId}`
   const keys = turn.convo.map(messageKey)
   const attempt = async (thread) => {
@@ -390,13 +402,13 @@ export async function chatCompletions({ body, auth, cfg, signal, conversation = 
     }
     const run = async (onEvent) => {
       try {
-        const res = await chat({ session, cfg, input: composed.input, signal: abort.signal, onEvent }).catch(async (e) => {
+        const res = await send(composed.input, onEvent).catch(async (e) => {
           // refused as too large although it was measured to fit: nothing
           // was taken, so it is sent once more, made smaller
           if (!(e instanceof UpstreamError) || e.kind !== "too_large" || !cfg.maxFrameBytes) throw e
           const smaller = { ...cfg, maxFrameBytes: Math.floor(cfg.maxFrameBytes * 0.7) }
           composed = await compose(turn, { auth, cfg: smaller, session, thread, threadId, signal: abort.signal })
-          return chat({ session, cfg, input: composed.input, signal: abort.signal, onEvent })
+          return send(composed.input, onEvent)
         })
         if (cfg.stateful) threads.commit({ id: threadId, account, session: conversation, custom: composed.custom }, keys)
         settle()

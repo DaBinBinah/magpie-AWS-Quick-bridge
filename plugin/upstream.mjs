@@ -99,6 +99,7 @@ export function dialInfo(sess) {
 
   let host = sess.wsHost.trim().replace(/\/+$/, "")
   if (host.startsWith("https://")) host = "wss://" + host.slice("https://".length)
+  else if (host.startsWith("http://")) host = "ws://" + host.slice("http://".length)
   else if (!host.startsWith("wss://") && !host.startsWith("ws://")) host = "wss://" + host
   let path = String(sess.wsPath ?? "").trim() || (gateway ? GATEWAY_WS_PATH : DEFAULT_WS_PATH)
   let target

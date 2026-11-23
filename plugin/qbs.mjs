@@ -45,20 +45,29 @@ export function unwrap(text) {
   return { status, body }
 }
 
-const gatewayHosts = new Map()
+// The host a Gateway tenant's chat is dialed at: GET /v1/discovery names the
+// tenant's cell. "" when the tenant does not say, and the tenant's own host
+// is dialed. The answer is kept for an hour, a missing one for five minutes.
+const cells = new Map()
 
-async function gatewayHost(auth, signal) {
+export async function cellHost(auth, signal) {
   const tenant = base(auth)
-  if (!gatewayHosts.has(tenant)) {
-    let host = new URL(tenant).host
-    try {
-      const body = parsed(await call(`${tenant}/v1/discovery`, { headers: { authorization: `Bearer ${auth.access}` } }, signal))
-      if (typeof body?.cellHost === "string" && body.cellHost) host = body.cellHost
-    } catch {}
-    gatewayHosts.set(tenant, host)
-  }
-  return gatewayHosts.get(tenant)
+  const known = cells.get(tenant)
+  if (known && Date.now() < known.until) return known.host
+  let host = ""
+  const wait = AbortSignal.timeout(10_000)
+  try {
+    const headers = { authorization: `Bearer ${auth.access}`, "x-amzn-qs-internal-trace-id": randomUUID() }
+    const body = parsed(await call(`${tenant}/v1/discovery`, { headers }, signal ? AbortSignal.any([signal, wait]) : wait))
+    if (typeof body?.cellHost === "string") host = body.cellHost.trim()
+  } catch {}
+  if (signal?.aborted) return ""
+  cells.set(tenant, { host, until: Date.now() + (host ? 60 : 5) * 60_000 })
+  return host
 }
+
+// After a cell that did not answer: the tenant is asked again next time.
+export const forgetCell = (auth) => cells.delete(base(auth))
 
 // Calls one path of the agent backend (profile/usage, api/ws-rpc, …).
 export async function invoke(auth, path, method = "GET", body = {}, { signal } = {}) {
@@ -68,7 +77,7 @@ export async function invoke(auth, path, method = "GET", body = {}, { signal } =
   if (isGatewayProvider(auth.quickProvider)) {
     const query = new URLSearchParams({ innerPath: path, _method: method })
     const account = encodeURIComponent(auth.awsAccountId || "default")
-    text = await call(`https://${await gatewayHost(auth, signal)}/accounts/${account}/invocations/rpc?${query}`, { method: "POST", headers, body: JSON.stringify(body ?? {}) }, signal)
+    text = await call(`${base(auth)}/accounts/${account}/invocations/rpc?${query}`, { method: "POST", headers, body: JSON.stringify(body ?? {}) }, signal)
   } else {
     const event = { eventType: "invokeAgent", eventBody: { invokeAgent: { path, queryParams: { _method: method }, body: body ?? {} } } }
     text = await call(`${base(auth)}/integration/quick-work/qbs-event`, { method: "POST", headers, body: JSON.stringify(event) }, signal)

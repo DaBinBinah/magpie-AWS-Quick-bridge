@@ -81,6 +81,22 @@ export function redirectURI(provider, port) {
   return isEnterpriseDiscovery(provider) ? `http://localhost:${port}` : `http://127.0.0.1:${port}`
 }
 
+// A tenant on these hosts is served by the Gateway, whichever account type
+// was picked: <tenant>.<region>.enterprise.quick.aws.com, and with a
+// "desktop." label before October 2026. The Gateway has no user-info path
+// (it answers 404 UnknownOperationException) and speaks its own framing.
+const GATEWAY_ZONE = /\.enterprise\.quick\.aws\.(com|dev)$/i
+
+export function providerFor(provider, tenantUrl) {
+  if (provider !== "enterprise") return provider
+  const tenant = String(tenantUrl ?? "").trim()
+  try {
+    return GATEWAY_ZONE.test(new URL(tenant.includes("://") ? tenant : "https://" + tenant).hostname) ? "gateway" : provider
+  } catch {
+    return provider
+  }
+}
+
 function userInfoBase(provider, stage, tenantUrl) {
   if (isEnterpriseDiscovery(provider)) return tenantUrl ?? ""
   const tenant = String(tenantUrl ?? "").replace(/\/+$/, "")
@@ -205,12 +221,41 @@ const postForm = (endpoint, form) =>
     body: new URLSearchParams(form).toString(),
   })
 
-async function fetchUserInfo(provider, stage, tenantUrl, accessToken) {
-  if (!accessToken) throw new Error("token response has no access_token")
+// Who the tokens say the account is, for a Gateway tenant, which has no
+// user-info to ask. The claims of such a token are not documented, so the
+// usual names are read and whatever is missing stays empty.
+export function claimedUserInfo(tokens) {
+  const claims = { ...decodeJWT(tokens?.accessToken), ...decodeJWT(tokens?.idToken) }
+  const text = (...keys) => keys.map((k) => claims[k]).find((v) => typeof v === "string" && v.trim())?.trim() ?? ""
+  const arn = [text("userArn", "user_arn", "actor_arn"), text("sub")].find((v) => v.startsWith("arn:")) ?? ""
+  const account = text("awsAccountId", "aws_account_id", "accountId", "account_id")
+  return {
+    email: text("email", "emailAddress") || (text("preferred_username").includes("@") ? text("preferred_username") : ""),
+    userName: text("userName", "user_name", "username", "preferred_username"),
+    displayName: text("displayName", "display_name", "name"),
+    userArn: arn,
+    awsAccountId: /^\d{12}$/.test(account) ? account : /^arn:[^:]*:[^:]*:[^:]*:(\d{12}):/.exec(arn)?.[1] ?? "",
+    accountName: text("accountName", "account_name"),
+  }
+}
+
+const unknownOperation = (e) => e instanceof HTTPError && e.status === 404 && /UnknownOperation/i.test(e.body)
+
+// The account's details and the provider it turned out to be: an
+// organization's tenant that answers user-info as the Gateway does (404
+// UnknownOperationException) is one, whatever its host is called.
+async function fetchUserInfo(provider, stage, tenantUrl, tokens) {
+  if (!tokens.accessToken) throw new Error("token response has no access_token")
+  if (isGateway(provider)) return { provider, info: claimedUserInfo(tokens) }
   const base = userInfoBase(provider, stage, tenantUrl).replace(/\/+$/, "")
   if (!base) throw new Error("discovery response has no tenant_url")
-  const raw = await postJSON(`${base}/integration/quick-work/user-info`, {}, { authorization: `Bearer ${accessToken}` })
-  return normalizeUserInfo(raw)
+  try {
+    const raw = await postJSON(`${base}/integration/quick-work/user-info`, {}, { authorization: `Bearer ${tokens.accessToken}` })
+    return { provider, info: normalizeUserInfo(raw) }
+  } catch (e) {
+    if (provider !== "enterprise" || !unknownOperation(e)) throw e
+    return { provider: "gateway", info: claimedUserInfo(tokens) }
+  }
 }
 
 const prefer = (value, fallback) => (String(value ?? "").trim() ? value : fallback ?? "")
@@ -234,7 +279,7 @@ export function sessionFields(base, tokens, info) {
   } catch {}
   if (!parsed?.host) throw new Error(`cannot derive ws_host from tenant_url ${JSON.stringify(tenant)}`)
 
-  const claims = decodeJWT(idToken)
+  const claims = decodeJWT(idToken) ?? decodeJWT(access)
   const sub = typeof claims?.sub === "string" ? claims.sub : ""
   const actorArn = info.userArn.trim() || (sub.startsWith("arn:") ? sub : "")
   const region = String(base.region ?? "").trim() || (typeof claims?.region === "string" ? claims.region : "") || "us-east-1"
@@ -252,7 +297,7 @@ export function sessionFields(base, tokens, info) {
     refresh: tokens.refreshToken.trim() || base.refresh || "",
     expires,
     idToken,
-    accountId: email || info.userName || displayName || actorArn || base.accountId || "",
+    accountId: email || info.userName || displayName || actorArn || base.accountId || parsed.hostname,
     email,
     displayName,
     accountName,
@@ -286,7 +331,7 @@ const expired = (message) => Object.assign(new Error(message), { signIn: "expire
 export async function refresh(auth) {
   const token = String(auth?.refresh ?? "").trim()
   if (!token || token === "none") throw expired("Amazon Quick: no refresh token is stored; sign in again")
-  const provider = normalizedProvider(auth.quickProvider)
+  const provider = providerFor(normalizedProvider(auth.quickProvider), auth.tenantUrl)
 
   let raw
   try {
@@ -315,8 +360,8 @@ export async function refresh(auth) {
   }
   const tokens = tokensFrom(raw)
   if (!tokens.accessToken) throw new Error("refresh returned no access_token")
-  const info = await fetchUserInfo(provider, normalizedStage(auth.stage), auth.tenantUrl, tokens.accessToken)
-  return sessionFields({ ...auth, quickProvider: provider, stage: normalizedStage(auth.stage) }, tokens, info)
+  const who = await fetchUserInfo(provider, normalizedStage(auth.stage), auth.tenantUrl, tokens)
+  return sessionFields({ ...auth, quickProvider: who.provider, stage: normalizedStage(auth.stage) }, tokens, who.info)
 }
 
 const randomToken = () => randomBytes(32).toString("base64url")
@@ -403,6 +448,7 @@ export class LoginFlow {
       }
       if (!this.discovery.authEndpoint || !this.discovery.tokenEndpoint)
         throw new StepError(400, "discovery response is missing authEndpoint/tokenEndpoint")
+      this.provider = providerFor(this.provider, this.discovery.tenantUrl)
       this.clientId = q("clientId", "client_id")
       this.clientSecret = q("clientSecret", "client_secret")
       this.resource = q("resource") || resourceFor(this.discovery.tenantUrl)
@@ -500,7 +546,9 @@ export class LoginFlow {
     }
     let info
     try {
-      info = await fetchUserInfo(this.provider, this.stage, this.discovery.tenantUrl, tokens.accessToken)
+      const who = await fetchUserInfo(this.provider, this.stage, this.discovery.tenantUrl, tokens)
+      this.provider = who.provider
+      info = who.info
     } catch (e) {
       throw new StepError(502, `user info failed: ${e.message}`)
     }
