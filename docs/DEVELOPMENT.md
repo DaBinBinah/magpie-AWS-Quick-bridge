@@ -20,6 +20,8 @@ magpie plugin options magpie-AWS-Quick-bridge '{"thinking_effort": "medium", "ti
 | `default_model` | `smart` | 收到未知模型名时使用的 agent mode |
 | `timezone` / `locale` | `UTC` / `en-US` | 发给上游的时区与语言 |
 | `request_timeout` | `5m` | 单次上游请求超时（`30s`、`5m`、`1h`，或秒数） |
+| `header_wait` | `10s` | 流式请求最多等这么久就先回应（之后的错误写在流里）；Amazon Quick 先有输出就立刻回应。`off` 表示一直等到有输出 |
+| `show_quick_tools` | `true` | Amazon Quick 自己运行的工具（联网搜索等）开始时，在思考内容里显示一行 `[Quick: 工具名]` |
 | `keep_sessions` | `false` | 对话进入 Amazon Quick 的聊天列表和记忆，而不是使用隐身线程（也可在供应商编辑页的插件选项里开关） |
 | `web_search` | `false` | 允许 Amazon Quick 使用它自己的联网搜索；请求里的 `web_search_enabled` 优先 |
 | `stateful` | `true` | 多轮对话复用服务端线程、只发新增消息；`false` 时每次请求重发全部历史 |
@@ -79,6 +81,9 @@ sequenceDiagram
 - 系统提示词放在 `custom_prompt` 里。agent 开头那句自报家门（如 “You are Claude Code, Anthropic's official CLI for Claude.”）会换成一句“这段对话来自用户电脑上的编程 agent”，Claude Code 的计费头那一行会去掉：Amazon Quick 不是这些产品，被要求扮演时容易纠结身份而不干活。
 - 用户用中文、日文或韩文写的时候（看最近 4 条用户消息里用户自己打的字），带工具的请求会多一句说明：用这种语言思考和回复，工具参数里的文件名、路径、日志、报错和搜索词照原文抄，不要翻译。Amazon Quick 默认用英文思考，会把中文日志翻成英文再去搜，结果搜不到。
 - 模型名里方括号的部分（如 Claude Code 的 `[1m]`）不算名字的一部分，`advanced[1m]` 就是 `advanced`。
+- token 用量：Amazon Quick 一轮里每调用一次模型就报一次用量（每跑完一个自带工具多一次），每次都把整个上下文重新算一遍。输入取最后一次的，输出累加；全部相加会把上下文算成几倍，Claude Code 会因此过早压缩对话。我用真实账号测过：一轮两次联网搜索，两次上报的输入是 6.9 万和 7.9 万，相加是 14.9 万，实际上下文是 7.9 万。
+- 停止生成：请求被取消或超时的时候，先发 `stop_generation` 再断开。只断开连接的话 Amazon Quick 会把回复写完（真实账号上测过），发了之后它在 1 秒内结束这一轮。
+- Amazon Quick 的界面标记：它自己的提示词会让模型输出只有它的 App 能显示的内容（`<decision>` 选项卡片、`[@b1f307]` 这样的来源标记）。`custom_prompt` 里有一句说明，请它改用纯文本和 Markdown：选项写成编号列表，来源写出标题和地址；用户要的代码和文件内容不受影响。
 - 出错时尽量用 Magpie 能处理的状态回答：上游拒绝登录回 401（账号被标记为需要重新登录），限流回 429，超时回 504，其他上游错误回 502，Magpie 据此切换到下一个账号或模型。回复开始之后的错误只能写进流里。
 
 代码结构：

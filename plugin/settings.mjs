@@ -40,6 +40,10 @@ export function settings(options = {}) {
     requestTimeoutMs: durationMs(options.request_timeout, 5 * 60_000),
     // how often a ping message is sent while a reply is awaited; Amazon Quick drops a client silent for 95 seconds
     keepaliveMs: Math.min(durationMs(options.keepalive_interval, 25_000), 60_000),
+    // a streamed request is answered once Amazon Quick writes or this long has passed, whichever is first; "off" waits for it to write
+    headerWaitMs: /^(off|0)$/i.test(String(options.header_wait ?? "").trim()) ? 0 : durationMs(options.header_wait, 10_000),
+    // the tools Amazon Quick runs itself are named with the thinking, as "[Quick: web_search]"
+    showQuickTools: options.show_quick_tools !== false,
     proxy: text(options.proxy),
     provider: oauth.normalizedProvider(options.provider),
     stage: oauth.normalizedStage(options.build_stage),

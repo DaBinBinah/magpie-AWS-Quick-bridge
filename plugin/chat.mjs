@@ -272,8 +272,11 @@ async function complete(turn, run) {
 
 // Streams a turn as SSE. The Response is returned once the first chunk is
 // ready, so a turn that fails before that is still answered with a status
-// (and magpie can move on to another account).
-function stream(turn, run, abort) {
+// (and magpie can move on to another account). A turn that has written
+// nothing after `headerWaitMs` is answered then, with an open stream: the
+// refusals come within seconds, and an agent left without an answer for
+// minutes gives the request up.
+function stream(turn, run, abort, headerWaitMs = 0) {
   const encoder = new TextEncoder()
   let controller
   let started = false
@@ -293,14 +296,18 @@ function stream(turn, run, abort) {
     if (closed) return
     controller.enqueue(encoder.encode(typeof payload === "string" ? payload : `data: ${JSON.stringify(payload)}\n\n`))
   }
+  const base = () => ({ id: turn.id, object: "chat.completion.chunk", created: turn.created, model: turn.model })
+  const start = () => {
+    if (started) return
+    started = true
+    clearTimeout(waiting)
+    raw({ ...base(), choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })
+    first.resolve()
+  }
+  const waiting = headerWaitMs > 0 ? setTimeout(start, headerWaitMs) : null
   const chunk = (delta, finish = null, extra = {}) => {
-    const base = { id: turn.id, object: "chat.completion.chunk", created: turn.created, model: turn.model }
-    if (!started) {
-      started = true
-      raw({ ...base, choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })
-      first.resolve()
-    }
-    raw({ ...base, choices: [{ index: 0, delta, finish_reason: finish }], ...extra })
+    start()
+    raw({ ...base(), choices: [{ index: 0, delta, finish_reason: finish }], ...extra })
   }
   const end = () => {
     raw("data: [DONE]\n\n")
@@ -334,6 +341,7 @@ function stream(turn, run, abort) {
       end()
     })
     .catch((error) => {
+      clearTimeout(waiting)
       if (!started) return first.reject(error)
       raw({ error: { message: String(error?.message ?? error), type: "upstream_error", code: "upstream_error" } })
       end()
@@ -398,7 +406,7 @@ export async function chatCompletions({ body, auth, cfg, signal, conversation = 
         throw e
       }
     }
-    return turn.stream ? stream(turn, run, abort) : complete(turn, run)
+    return turn.stream ? stream(turn, run, abort, cfg.headerWaitMs) : complete(turn, run)
   }
 
   const thread = cfg.stateful ? threads.match(account, conversation, keys) : null

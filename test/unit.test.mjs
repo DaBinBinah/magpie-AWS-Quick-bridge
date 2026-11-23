@@ -68,6 +68,10 @@ describe("messages", () => {
     const sys = messages.systemPrompt([{ role: "system", content: "A" }, { role: "user", content: "u" }, { role: "developer", content: "B" }])
     expect(sys.startsWith("A\n\nB\n\nNote from the user:")).toBe(true)
     expect(messages.systemPrompt([{ role: "user", content: "u" }])).toBe(messages.UPSTREAM_PROMPT_OVERRIDE)
+    // Amazon Quick's app markup is asked to stay out, code and files are not meant
+    for (const said of ["decision or option cards", "artifacts", "sources block", "[@a1b2c3]", "plain text with a short numbered list", "not about code or file contents"])
+      expect(messages.PLAIN_TEXT_NOTE).toContain(said)
+    expect(messages.UPSTREAM_PROMPT_OVERRIDE).toEndWith(messages.PLAIN_TEXT_NOTE)
   })
 
   test("titles are cut at 60 characters", () => {

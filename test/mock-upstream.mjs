@@ -25,6 +25,7 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
     delayMs: 0, // how long a reply is held back, as a model that thinks
     idleMs: 0, // as Amazon Quick's 95 s: a client silent this long is dropped with IDLE_TIMEOUT (0: never)
     pings: 0, // the ping messages received
+    stops: [], // the thread of every stop_generation received
     usage: null, // what profile/usage answers instead of an account with plenty left
   }
 
@@ -179,6 +180,13 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
           return
         }
         if (event.type === "ping") state.pings++
+        // as Amazon Quick: a turn told to stop ends with what it had written
+        if (event.type === "stop_generation") {
+          state.stops.push(event.payload?.thread_id)
+          ws.data.stopped = true
+          ws.send(frame({ type: "text_complete", payload: { text: "" } }))
+          return ws.send(frame({ type: "message_complete", payload: {} }))
+        }
         if (event.type !== "user_message") return
         // as Amazon Quick: a message whose JSON is over some 65250 bytes is
         // refused (state.limit, for a test to lower)
@@ -189,8 +197,13 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
         state.turns.push(event.payload)
         if (event.payload.custom_prompt) state.custom.set(event.payload.thread_id, event.payload.custom_prompt)
         const events = reply(event.payload)
-        const answer = () => {
-          if (!ws.data.closed) for (const out of events) ws.send(frame(out))
+        // { wait: ms } in a script holds back what follows it
+        const answer = async () => {
+          for (const out of events) {
+            if (out.wait) await new Promise((r) => setTimeout(r, out.wait))
+            if (ws.data.closed || ws.data.stopped) return
+            if (!out.wait) ws.send(frame(out))
+          }
         }
         if (state.delayMs > 0) setTimeout(answer, state.delayMs)
         else answer()

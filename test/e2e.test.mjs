@@ -16,7 +16,7 @@ beforeAll(async () => {
   const client = { auth: { set: async ({ body }) => void saved.push(body) } }
   hooks = await plugin.server(
     { client, directory: "/tmp" },
-    { oidc_base: mock.url, discovery_url: mock.url + "/sn", data_plane_url: mock.url, callback_port: 0, request_timeout: "10s", keepalive_interval: "100ms" },
+    { oidc_base: mock.url, discovery_url: mock.url + "/sn", data_plane_url: mock.url, callback_port: 0, request_timeout: "10s", keepalive_interval: "100ms", header_wait: "300ms" },
   )
 })
 
@@ -109,6 +109,8 @@ describe("chat", () => {
     const turn = mock.state.turns.at(-1)
     expect(turn).toMatchObject({ text: "ping", agent_mode: "fast", send_origin: "programmatic", appVersion: "1.2.4660", user_timezone: "UTC" })
     expect(turn.custom_prompt).toStartWith("Be brief.\n\nNote from the user:")
+    // Amazon Quick's app markup is asked to stay out of an agent's screen
+    expect(turn.custom_prompt).toEndWith(_internal.messages.PLAIN_TEXT_NOTE)
     expect(turn.system_prompt).toBeUndefined()
     expect(turn.thinking_effort).toBeUndefined()
     // the conversation stays out of Amazon Quick's chat list and memory
@@ -250,13 +252,106 @@ describe("chat", () => {
     mock.state.script = null
   })
 
-  test("a cancelled request ends the upstream turn", async () => {
+  // a turn of two model calls with Amazon Quick's own tool between them, the
+  // counts as a real account reported them
+  const searched = () => [
+    { type: "thinking_delta", payload: { delta: "I'll look it up." } },
+    { type: "tool_start", payload: { tool_name: "web_search", tool_id: "t1", arguments: {} } },
+    { type: "tool_arguments", payload: { tool_name: "web_search", tool_id: "t1", arguments: { query: "Reykjavik population" } } },
+    { type: "turn_usage", payload: { input_tokens: 4, output_tokens: 161, cache_read_tokens: 32732, cache_write_tokens: 36586, total_tokens: 69483 } },
+    { type: "tool_result", payload: { tool_name: "web_search", tool_id: "t1", result: "…", status: "success" } },
+    { type: "tool_start", payload: { tool_name: "web_search", tool_id: "t1", arguments: {} } },
+    { type: "tool_start", payload: { tool_name: "read_file", tool_id: "t2", arguments: {} } },
+    { type: "text_delta", payload: { delta: "139,000" } },
+    { type: "turn_usage", payload: { input_tokens: 2, output_tokens: 340, cache_read_tokens: 69318, cache_write_tokens: 9981, total_tokens: 79641 } },
+    { type: "message_complete", payload: {} },
+    { type: "turn_completed", payload: {} },
+  ]
+
+  test("a turn of several model calls: the context is counted once, Amazon Quick's own tools are shown as they start", async () => {
+    mock.state.script = searched
+    const body = await (await post({ model: "smart", messages: [{ role: "user", content: "search" }] })).json()
+    // what went in is the last call's (2 + 69318 + 9981), not both calls' added up
+    expect(body.usage).toEqual({ prompt_tokens: 79301, completion_tokens: 501, total_tokens: 79802, prompt_tokens_details: { cached_tokens: 69318 } })
+    expect(body.choices[0].message).toEqual({ role: "assistant", content: "139,000", reasoning_content: "I'll look it up.\n[Quick: web_search]\n[Quick: read_file]\n" })
+    expect(body.choices[0].finish_reason).toBe("stop")
+
+    const events = await sse(await post({ model: "smart", stream: true, stream_options: { include_usage: true }, messages: [{ role: "user", content: "search again" }] }))
+    expect(events.map((e) => e.choices[0]?.delta?.reasoning_content ?? "").join("")).toContain("[Quick: web_search]\n")
+    expect(events.at(-1).usage).toMatchObject({ prompt_tokens: 79301, total_tokens: 79802 })
+
+    // show_quick_tools: false leaves the thinking as Amazon Quick wrote it
+    const { upstream, settings } = _internal
+    const cfg = { ...settings({ show_quick_tools: false }), requestTimeoutMs: 5000 }
+    const input = { prompt: "search", model: "smart" }
+    let thought = ""
+    await upstream.chat({ session: upstream.sessionFromAuth(auth, cfg), cfg, input, onEvent: (e) => e.type === "reasoning" && (thought += e.text) })
+    expect(thought).toBe("I'll look it up.")
+    mock.state.script = null
+  })
+
+  test("a streamed request is answered while Amazon Quick is still silent, and what fails after that is said in the stream", async () => {
+    mock.state.script = () => [{ wait: 900 }, { type: "text_delta", payload: { delta: "late" } }, { type: "message_complete", payload: {} }, { type: "turn_completed", payload: {} }]
+    let at = Date.now()
+    const res = await post({ model: "smart", stream: true, messages: [{ role: "user", content: "take your time" }] })
+    const waited = Date.now() - at
+    expect(res.status).toBe(200)
+    expect(waited).toBeGreaterThanOrEqual(250)
+    expect(waited).toBeLessThan(800)
+    const events = await sse(res)
+    expect(events[0].choices[0].delta).toEqual({ role: "assistant" })
+    expect(events.map((e) => e.choices[0]?.delta?.content ?? "").join("")).toBe("late")
+
+    // not streamed, the whole reply is waited for
+    at = Date.now()
+    expect((await (await post({ model: "smart", messages: [{ role: "user", content: "take your time, twice" }] })).json()).choices[0].message.content).toBe("late")
+    expect(Date.now() - at).toBeGreaterThanOrEqual(850)
+
+    mock.state.script = () => [{ wait: 600 }, { type: "error", payload: { message: "it broke" } }]
+    const failed = await post({ model: "smart", stream: true, messages: [{ role: "user", content: "break late" }] })
+    expect(failed.status).toBe(200)
+    expect((await sse(failed)).at(-1).error.message).toContain("it broke")
+    // within the wait, a failure is still a status
+    mock.state.script = () => [{ wait: 100 }, { type: "error", payload: { message: "it broke" } }]
+    expect((await post({ model: "smart", stream: true, messages: [{ role: "user", content: "break early" }] })).status).toBe(502)
+    mock.state.script = null
+  })
+
+  const until = async (cond, ms = 2000) => {
+    for (const end = Date.now() + ms; Date.now() < end && !cond(); ) await new Promise((r) => setTimeout(r, 10))
+    return cond()
+  }
+
+  test("a cancelled request tells Amazon Quick to stop the turn", async () => {
+    // a turn that ended by itself is not stopped
+    expect(mock.state.stops).toEqual([])
     mock.state.script = () => []
     const abort = new AbortController()
     const pending = post({ model: "smart", messages: [{ role: "user", content: "ping" }] }, { signal: abort.signal })
     setTimeout(() => abort.abort(), 50)
     await expect(pending).rejects.toThrow()
     await pending.catch(() => {})
+    expect(await until(() => mock.state.stops.length === 1)).toBe(true)
+    expect(mock.state.stops[0]).toBe(mock.state.turns.at(-1).thread_id)
+
+    // a reader who leaves a stream stops it too, with the text it had
+    mock.state.script = () => [{ type: "text_delta", payload: { delta: "one " } }, { wait: 5000 }, { type: "text_delta", payload: { delta: "two" } }]
+    const res = await post({ model: "smart", stream: true, messages: [{ role: "user", content: "a long one" }] })
+    const reader = res.body.getReader()
+    await reader.read()
+    await reader.cancel()
+    expect(await until(() => mock.state.stops.length === 2)).toBe(true)
+    expect(mock.state.stops[1]).toBe(mock.state.turns.at(-1).thread_id)
+    mock.state.script = null
+  })
+
+  test("a turn that runs out of time is stopped as well", async () => {
+    mock.state.script = () => []
+    const { upstream, settings } = _internal
+    const cfg = { ...settings({}), requestTimeoutMs: 150 }
+    const before = mock.state.stops.length
+    await expect(upstream.chat({ session: upstream.sessionFromAuth(auth, cfg), cfg, input: { prompt: "never answered", model: "smart" } })).rejects.toMatchObject({ kind: "timeout" })
+    expect(await until(() => mock.state.stops.length === before + 1)).toBe(true)
     mock.state.script = null
   })
 })

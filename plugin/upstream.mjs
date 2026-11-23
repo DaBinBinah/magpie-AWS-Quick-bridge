@@ -14,6 +14,7 @@ const READ_IDLE_MS = 2 * 60_000
 const AFTER_COMPLETE_MS = 5_000
 const HANDSHAKE_MS = 20_000
 const PING_MS = 25_000
+const STOP_SETTLE_MS = 3_000
 
 const TERMINAL = new Set(["turn_completed", "turn_aborted", "turn_ended", "stream_ended", "chat_complete"])
 const FAILURES = new Set(["error", "session_error", "stream_error", "turn_failed"])
@@ -173,7 +174,7 @@ const present = (v) => v !== undefined && v !== null
 
 // Sends one prompt and resolves with { text, toolCalls, usage }. Text deltas
 // and tool calls are reported through onEvent as they arrive:
-// { type: "text", text } | { type: "tool_call" | "tool_call_update", toolCall }.
+// { type: "text" | "reasoning", text } | { type: "tool_call" | "tool_call_update", toolCall }.
 export function chat({ session, cfg, input, signal, onEvent }) {
   const { url, headers, gateway } = dialInfo(session)
   const threadId = String(input.threadId ?? "").trim() || uuid()
@@ -186,8 +187,11 @@ export function chat({ session, cfg, input, signal, onEvent }) {
     const sent = new Set()
     const partialArgs = new Map()
     let text = ""
+    let thought = ""
     let opened = false
     let settled = false
+    // the turn runs at Amazon Quick: the message went and no end was heard
+    let live = false
     let idleTimer = null
     let completeTimer = null
     let pingTimer = null
@@ -207,13 +211,38 @@ export function chat({ session, cfg, input, signal, onEvent }) {
 
     const send = (value) => ws.send(encodeFrame(gateway, value))
 
+    const close = () => {
+      try {
+        ws.close()
+      } catch {}
+    }
+
+    // Amazon Quick writes a reply to its end whether or not it is read, so
+    // a turn left while it runs is told to stop. It answers within a second
+    // (text_complete, message_complete); the socket stays for that, as a
+    // stop sent into a socket closed at once may not go out.
+    const stop = () => {
+      try {
+        if (!live || ws.readyState !== 1) return false
+        send({ type: "stop_generation", payload: { thread_id: threadId } })
+      } catch {
+        return false
+      }
+      const timer = setTimeout(close, STOP_SETTLE_MS)
+      timer.unref?.()
+      const done = () => (clearTimeout(timer), close())
+      ws.onclose = ws.onerror = () => clearTimeout(timer)
+      ws.onmessage = (event) => {
+        for (const env of envelopes(event)) if (env?.type === "message_complete" || TERMINAL.has(env?.type) || FAILURES.has(env?.type)) return done()
+      }
+      return true
+    }
+
     const cleanup = () => {
       for (const t of [idleTimer, completeTimer, handshakeTimer, requestTimer]) clearTimeout(t)
       clearInterval(pingTimer)
       signal?.removeEventListener("abort", onAbort)
-      try {
-        ws.close()
-      } catch {}
+      if (!stop()) close()
     }
 
     const result = () => {
@@ -269,6 +298,10 @@ export function chat({ session, cfg, input, signal, onEvent }) {
         fail(e)
       }
     }
+    const think = (delta) => {
+      thought += delta
+      emit({ type: "reasoning", text: delta })
+    }
     const emitTool = (tc) => {
       if (sent.has(tc.id)) return
       sent.add(tc.id)
@@ -315,10 +348,11 @@ export function chat({ session, cfg, input, signal, onEvent }) {
           return chunked(env.payload && typeof env.payload === "object" ? p : env)
         case "thinking_delta": {
           const delta = deltaText(env.payload)
-          if (delta) emit({ type: "reasoning", text: delta })
+          if (delta) think(delta)
           return
         }
         case "guardrail_blocked":
+          live = false
           return fail(new UpstreamError("blocked", String(p.message || env.message || "Amazon Quick's guardrail blocked the reply")))
         case "text_delta": {
           const delta = deltaText(env.payload)
@@ -333,18 +367,28 @@ export function chat({ session, cfg, input, signal, onEvent }) {
             emit({ type: "text", text: p.text })
           }
           return
-        case "turn_usage":
-          usage.prompt += Number(p.input_tokens) || 0
-          usage.completion += Number(p.output_tokens) || 0
-          usage.total += Number(p.total_tokens) || 0
-          usage.cacheRead += Number(p.cache_read_tokens) || 0
-          usage.cacheWrite += Number(p.cache_write_tokens) || 0
+        case "turn_usage": {
+          // One for every model call of the turn (one more after each of
+          // Amazon Quick's own tools), and each counts the whole context
+          // again: what went in is the last call's, what came out adds up.
+          const count = (v) => Number(v) || 0
+          const input = [p.input_tokens, p.cache_read_tokens, p.cache_write_tokens].map(count)
+          if (input.some((n) => n > 0)) [usage.prompt, usage.cacheRead, usage.cacheWrite] = input
+          usage.completion += count(p.output_tokens)
+          usage.total = usage.prompt + usage.cacheRead + usage.cacheWrite + usage.completion
           if (typeof p.resolved_model_id === "string") usage.model = p.resolved_model_id
           return
+        }
         case "tool_start": {
-          const tc = getTool(toolId(p), p.tool_name)
+          const id = toolId(p)
+          const known = id && tools.has(String(id).trim())
+          const tc = getTool(id, p.tool_name)
           const args = argumentString(p.arguments)
           if (args !== "{}") tc.arguments = args
+          // Amazon Quick's own tool (a web search, a file it reads) runs on
+          // its side and may take minutes with nothing written: its name is
+          // shown with the thinking, so the turn is seen to move
+          if (!known && cfg.showQuickTools && tc.name) think(`${thought && !thought.endsWith("\n") ? "\n" : ""}[Quick: ${tc.name}]\n`)
           return
         }
         case "tool_arguments":
@@ -398,15 +442,37 @@ export function chat({ session, cfg, input, signal, onEvent }) {
           }
           clearTimeout(completeTimer)
           completeTimer = p.continuation_expected ? null : setTimeout(succeed, AFTER_COMPLETE_MS)
+          live = !!p.continuation_expected
           return
         default:
           if (FAILURES.has(env.type)) {
+            live = false
             const code = String(p.code ?? env.code ?? "")
             if (code === "FrameTooLarge") return fail(new UpstreamError("too_large", errorText(env)))
             return fail(new UpstreamError("upstream", `upstream ${env.type}: ${errorText(env)}`))
           }
-          if (TERMINAL.has(env.type)) succeed()
+          if (TERMINAL.has(env.type)) {
+            live = false
+            succeed()
+          }
       }
+    }
+
+    // The JSON envelopes of one WebSocket message.
+    const envelopes = (event) => {
+      let frames = []
+      try {
+        if (typeof event.data === "string") frames = [event.data]
+        else frames = gateway ? gatewayDecode(event.data) : aidpDecode(event.data)
+      } catch {}
+      return frames.flatMap((frame) => {
+        try {
+          const env = JSON.parse(frame)
+          return env && typeof env === "object" ? [env] : []
+        } catch {
+          return []
+        }
+      })
     }
 
     ws.onopen = () => {
@@ -432,6 +498,7 @@ export function chat({ session, cfg, input, signal, onEvent }) {
         // title; an incognito one starts with its first message.
         if (cfg.keepSessions && !input.resume) send({ type: "session_create", payload: { session_id: threadId, title } })
         send(userMessage(session, cfg, { ...input, threadId }))
+        live = true
       } catch (e) {
         return fail(new UpstreamError("transport", `send user_message: ${e.message}`))
       }
@@ -457,7 +524,10 @@ export function chat({ session, cfg, input, signal, onEvent }) {
         else frames = gateway ? gatewayDecode(event.data) : aidpDecode(event.data)
       } catch (e) {
         // an event-stream error frame is the service refusing the turn
-        if (/^upstream error \[/.test(e.message)) fail(new UpstreamError("upstream", e.message))
+        if (/^upstream error \[/.test(e.message)) {
+          live = false
+          fail(new UpstreamError("upstream", e.message))
+        }
         return
       }
       for (const frame of frames) {
@@ -474,6 +544,7 @@ export function chat({ session, cfg, input, signal, onEvent }) {
 
     let refused = false
     ws.onerror = (event) => {
+      live = false
       const message = String(event?.message || event?.error?.message || "connection error")
       if (!opened) {
         const dialFailed = (status) =>
@@ -487,6 +558,7 @@ export function chat({ session, cfg, input, signal, onEvent }) {
     }
 
     ws.onclose = (event) => {
+      live = false
       if (refused) return
       if (!opened) return fail(new UpstreamError("handshake", `upstream WebSocket dial failed: closed (${event?.code ?? 0})`))
       dropped(new UpstreamError("transport", `upstream WebSocket read: closed (${event?.code ?? 0}) ${event?.reason ?? ""}`.trim()))
