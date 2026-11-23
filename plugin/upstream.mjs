@@ -79,9 +79,12 @@ export const encodeFrame = (gateway, value) => (gateway ? gatewayEncode(JSON.str
 // The account fields the transport needs, merged with handshake defaults.
 export function sessionFromAuth(auth, cfg) {
   // a Gateway session names itself by this id, so it is left as it was
-  const device = cfg.stableDeviceId && !isGatewayProvider(auth?.quickProvider) && isDeviceId(auth?.deviceId) ? auth.deviceId : ""
+  const gateway = isGatewayProvider(auth?.quickProvider)
+  const device = cfg.stableDeviceId && !gateway && isDeviceId(auth?.deviceId) ? auth.deviceId : ""
   return {
-    jwt: auth?.idToken || auth?.access || "",
+    // the Gateway is an OAuth resource: the access token is what its calls
+    // and its chat take, an id_token is for the App Integrations side
+    jwt: (gateway ? auth?.access || auth?.idToken : auth?.idToken || auth?.access) || "",
     wsHost: auth?.wsHost ?? "",
     wsPath: auth?.wsPath ?? "",
     provider: auth?.quickProvider ?? "social",

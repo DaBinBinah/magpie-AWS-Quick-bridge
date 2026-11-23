@@ -7,6 +7,7 @@ import { chatCompletions } from "../plugin/chat.mjs"
 import * as oauth from "../plugin/oauth.mjs"
 import * as qbs from "../plugin/qbs.mjs"
 import { settings } from "../plugin/settings.mjs"
+import { dialInfo, sessionFromAuth } from "../plugin/upstream.mjs"
 import { gatewayDecode, gatewayEncode } from "../plugin/wire.mjs"
 
 const WS_PATH = "/ws/service/SpaceNeedleConversationService/operation/ChatBidirectionalStream"
@@ -202,6 +203,17 @@ describe("an organization's tenant on the Gateway", () => {
     state.accounts.length = 0
     expect(await qbs.usage(account)).toMatchObject({ plan: "Enterprise", user: "ada@corp.example" })
     expect(state.accounts).toEqual(["123456789012"])
+  })
+
+  test("the Gateway's chat is given the access token, the App Integrations side the id_token", () => {
+    const bearer = (quickProvider) => dialInfo(sessionFromAuth({ quickProvider, access: "the-access", idToken: "the-id", wsHost: "h" }, {})).headers.Authorization
+    expect(bearer("gateway")).toBe("Bearer the-access")
+    expect(bearer("social_gateway")).toBe("Bearer the-access")
+    expect(bearer("enterprise")).toBe("Bearer the-id")
+    expect(bearer("social")).toBe("Bearer the-id")
+    // with one of the two only, that one
+    expect(dialInfo(sessionFromAuth({ quickProvider: "gateway", idToken: "the-id", wsHost: "h" }, {})).headers.Authorization).toBe("Bearer the-id")
+    expect(dialInfo(sessionFromAuth({ quickProvider: "enterprise", access: "the-access", wsHost: "h" }, {})).headers.Authorization).toBe("Bearer the-access")
   })
 
   test("a tenant that names no cell, or a cell that does not answer, is dialed itself", async () => {
