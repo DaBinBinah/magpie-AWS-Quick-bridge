@@ -448,6 +448,32 @@ describe("fitting a message", () => {
     expect(out.input.prompt).toBe("a".repeat(20))
     expect(out.json).toBeGreaterThan(60_000)
   })
+
+  test("an oversized ZCode context goes in the attachment, not the current question", async () => {
+    const context = `<system-reminder>\n${"Project context. ".repeat(4500)}\n</system-reminder>`
+    const question = "你好，你是谁？"
+    const turn = prepare({
+      model: "smart",
+      messages: [
+        { role: "system", content: "You are ZCode, an interactive agent\n\nKeep my answer brief." },
+        { role: "user", content: `${context}\n${question}` },
+      ],
+      tools: [tool(1)],
+    }, cfg)
+    const session = _internal.upstream.sessionFromAuth({ idToken: "x", wsHost: "h", quickProvider: "social" }, cfg)
+    const contents = []
+    const out = await _internal.compose(turn, {
+      auth: {}, cfg, session, thread: null, threadId: "00000000-0000-0000-0000-000000000000",
+      upload: async (_, file) => {
+        contents.push(new TextDecoder().decode(file.bytes))
+        return { type: "file", name: file.name }
+      },
+    })
+    expect(out.input.prompt).toEndWith(`\n\n${question}`)
+    expect(contents).toEqual([context])
+    expect(out.input.systemPrompt).toContain("Keep my answer brief.")
+    expect(out.input.systemPrompt).toContain("mcp__server_1__do_some_thing_1")
+  })
 })
 
 describe("the proxy of a chat WebSocket", () => {
