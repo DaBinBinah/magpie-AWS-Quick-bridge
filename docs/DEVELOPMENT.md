@@ -20,6 +20,8 @@ magpie plugin options magpie-AWS-Quick-bridge '{"thinking_effort": "medium", "ti
 | `default_model` | `smart` | 收到未知模型名时使用的 agent mode |
 | `timezone` / `locale` | `UTC` / `en-US` | 发给上游的时区与语言 |
 | `request_timeout` | `5m` | 单次上游请求超时（`30s`、`5m`、`1h`，或秒数） |
+| `read_idle` | `2m` | Amazon Quick 这么久没有写出任何内容（文字、思考、工具事件、用量）就按超时结束这一轮；它对 ping 的应答、`keepalive`、状态和任务列表通知不算 |
+| `tool_spec_every` | `6` | 续接的线程每隔这么多轮重发一次完整的工具说明；`0` 不定期重发。模型回了工具结果却没调用工具时，下一轮总会重发 |
 | `header_wait` | `10s` | 流式请求最多等这么久就先回应（之后的错误写在流里）；Amazon Quick 先有输出就立刻回应。`off` 表示一直等到有输出 |
 | `show_quick_tools` | `true` | Amazon Quick 自己运行的工具（联网搜索等）开始时，在思考内容里显示一行 `[Quick: 工具名]` |
 | `keep_sessions` | `false` | 对话进入 Amazon Quick 的聊天列表和记忆，而不是使用隐身线程（也可在供应商编辑页的插件选项里开关） |
@@ -183,7 +185,7 @@ m provider test aws-quick
 - Amazon Quick 会在每轮加上它自己的系统提示词和工具（我的账号上一条短消息约占 6.9 万输入 token，大部分命中缓存），插件无法去掉；额度按 Amazon Quick 的 credits 计。
 - 内容转成附件后，模型要先用它自己的文件工具读取，这一轮会慢一些。
 - 线程缓存在插件进程的内存里，Magpie 重启后下一次请求会重发全部历史。
-- 工具桥接是文本协议，模型偶尔可能不遵守；回复以 `{`、`[` 或反引号开头时会先整段缓冲，以判断它是不是一个没带标记的工具调用。缺了 `</client_tool_call>` 但 JSON 完整的调用照常执行；JSON 字符串里没转义的换行、制表符按转义处理。
+- 工具桥接是文本协议，模型偶尔可能不遵守；回复以 `{`、`[` 或反引号开头时会先整段缓冲，以判断它是不是一个没带标记的工具调用。缺了 `</client_tool_call>` 但 JSON 完整的调用照常执行；JSON 字符串里没转义的换行、制表符按转义处理。调用的参数只检查必填项和最外层的类型（`string`、`number`、`integer`、`boolean`、`array`、`object`、`null`），不合格的调用仍交给客户端，下一轮在用户消息前加一条说明，告诉模型哪个参数错了。
 - 流式回复的开头如果可能是额度用完的那句话（最多 80 个字符），会先缓冲到能判断为止。
 - 代理：Magpie 会给插件的 `fetch`（登录、续期、查额度）自动加上它的代理，但不管 WebSocket，Bun 的 WebSocket 自己也不读代理环境变量（Bun 1.3.11 和 1.4.5 上实测），所以 0.3.11 及之前登录走代理、聊天直连。现在没填 `proxy` 时，聊天连接读环境变量：先 `MAGPIE_HTTPS_PROXY` / `MAGPIE_ALL_PROXY`（Magpie 把“设置”里的全局代理以这组名字传给插件，实测；SOCKS 代理它会先转成 HTTP 地址），再 `HTTPS_PROXY` / `ALL_PROXY`，大小写都认；`MAGPIE_NO_PROXY` / `NO_PROXY` 里的主机和本机地址不走代理；不是 `http://` 或 `https://` 的代理地址跳过。限制有三条：Magpie 里给单个供应商或账号设的代理不在环境变量里，聊天连接拿不到，要在 `proxy` 选项里再填一次；供应商在 Magpie 里设成“直连”而全局有代理时，把 `proxy` 填成 `direct`；本机 API 用 Node 运行时，Node 的 WebSocket 不接受代理参数，`proxy` 选项和上面这些变量都不起作用，要用 `NODE_USE_ENV_PROXY=1 HTTPS_PROXY=…` 启动它（Node 24 实测）。经过真实代理连 Amazon Quick 我没有测过，只用本地的模拟代理测过。
 - OpenCode 2.x 的入口（`opencode2.mjs`）只通过了 Magpie 社区仓库的检查脚本，没有在 OpenCode 2.x 里实际运行过。

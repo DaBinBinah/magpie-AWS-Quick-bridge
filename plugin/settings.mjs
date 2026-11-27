@@ -40,6 +40,10 @@ export function settings(options = {}) {
     maxFrameBytes: Number.isInteger(options.max_frame_bytes) && options.max_frame_bytes >= 0 ? options.max_frame_bytes : 63_000,
     defaultModel: mapModel(options.default_model, "smart"),
     requestTimeoutMs: durationMs(options.request_timeout, 5 * 60_000),
+    // a turn Amazon Quick writes nothing for this long (its answers to pings and status notices aside) is given up
+    readIdleMs: durationMs(options.read_idle, 2 * 60_000),
+    // a continued thread is given the whole tool description again every this many turns; 0 never
+    toolSpecEvery: Number.isInteger(options.tool_spec_every) && options.tool_spec_every >= 0 ? options.tool_spec_every : 6,
     // how often a ping message is sent while a reply is awaited; Amazon Quick drops a client silent for 95 seconds
     keepaliveMs: Math.min(durationMs(options.keepalive_interval, 25_000), 60_000),
     // a streamed request is answered once Amazon Quick writes or this long has passed, whichever is first; "off" waits for it to write

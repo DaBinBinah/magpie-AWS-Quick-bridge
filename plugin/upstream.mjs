@@ -18,6 +18,9 @@ const STOP_SETTLE_MS = 3_000
 
 const TERMINAL = new Set(["turn_completed", "turn_aborted", "turn_ended", "stream_ended", "chat_complete"])
 const FAILURES = new Set(["error", "session_error", "stream_error", "turn_failed"])
+// Events that come whether or not the turn moves on (the answer to a ping
+// among them): they do not put off the read timeout.
+const NOISE = new Set(["status", "keepalive", "runs_updated", "task_list_update", "title_generated"])
 
 export class UpstreamError extends Error {
   // kind: "handshake" (status is the HTTP status the upgrade got, 0 when
@@ -329,7 +332,7 @@ export function chat({ session, cfg, input, signal, onEvent }) {
 
     const armIdle = () => {
       clearTimeout(idleTimer)
-      idleTimer = setTimeout(() => dropped(new UpstreamError("timeout", "upstream WebSocket read timed out")), READ_IDLE_MS)
+      idleTimer = setTimeout(() => dropped(new UpstreamError("timeout", "upstream WebSocket read timed out")), cfg.readIdleMs || READ_IDLE_MS)
     }
 
     const emit = (event) => {
@@ -384,6 +387,7 @@ export function chat({ session, cfg, input, signal, onEvent }) {
 
     const handle = (env) => {
       const p = env.payload && typeof env.payload === "object" ? env.payload : {}
+      if (!NOISE.has(env.type)) armIdle()
       switch (env.type) {
         case "_chunked_frame":
           return chunked(env.payload && typeof env.payload === "object" ? p : env)
@@ -558,7 +562,6 @@ export function chat({ session, cfg, input, signal, onEvent }) {
 
     ws.onmessage = (event) => {
       if (settled) return
-      armIdle()
       let frames
       try {
         if (typeof event.data === "string") frames = [event.data]

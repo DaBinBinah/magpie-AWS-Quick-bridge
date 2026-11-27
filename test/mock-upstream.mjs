@@ -27,6 +27,7 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
     delayMs: 0, // how long a reply is held back, as a model that thinks
     idleMs: 0, // as Amazon Quick's 95 s: a client silent this long is dropped with IDLE_TIMEOUT (0: never)
     pings: 0, // the ping messages received
+    pong: false, // whether a ping is answered, as Amazon Quick does, with a status event
     stops: [], // the thread of every stop_generation received
     usage: null, // what profile/usage answers instead of an account with plenty left
   }
@@ -183,6 +184,7 @@ export function startMock({ port = 0, email = "ada@example.com" } = {}) {
           return
         }
         if (event.type === "ping") state.pings++
+        if (event.type === "ping" && state.pong) ws.send(frame({ type: "status", payload: { status: "pong" } }))
         if (event.type === "session_connect") state.connects.push(event.payload)
         // as Amazon Quick: a turn told to stop ends with what it had written
         if (event.type === "stop_generation") {

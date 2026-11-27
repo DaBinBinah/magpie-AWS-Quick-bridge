@@ -6,7 +6,7 @@
 import { UPSTREAM_PROMPT_OVERRIDE, isSystemMessage, languageNote, lastUserText, promptBlocks, systemText, titleFor, uuid } from "./messages.mjs"
 import * as qbs from "./qbs.mjs"
 import { ThreadStore, digest, messageKey } from "./threads.mjs"
-import { BridgeStream, TOOL_DETAILS, TOOL_REMINDER, buildToolBridgePrompt, parseClientToolCalls, parseToolChoice, requestedToolNames } from "./toolbridge.mjs"
+import { BridgeStream, TOOL_DETAILS, TOOL_REMINDER, argumentProblems, buildToolBridgePrompt, parseClientToolCalls, parseToolChoice, requestedToolNames, toolSchemas } from "./toolbridge.mjs"
 import { UpstreamError, chat, frameBytes, sessionFromAuth, userMessage } from "./upstream.mjs"
 import { isGatewayProvider } from "./wire.mjs"
 
@@ -84,13 +84,13 @@ export const refused = (error) => error instanceof UpstreamError && (error.kind 
 // the account's used-up allowance (qbs.spentAllowance), when it has one.
 export function failureResponse(error, spent = null) {
   if (spent && refused(error)) {
-    const back = spent.secs > 0 ? `; it resets in ${span(spent.secs)}` : ""
+    const back = spent.secs > 0 ? `; it resets in ${span(spent.secs)}; try again in ${span(spent.secs)}` : ""
     return errorResponse(429, "rate_limit_exceeded", `Amazon Quick's ${spent.name} allowance is used up${back} (${error.message})`, {
       ...(spent.secs > 0 ? { "retry-after": String(Math.min(spent.secs, REST_MAX_SECS)) } : {}),
     })
   }
   if (error instanceof UpstreamError && error.kind === "usage_limit")
-    return errorResponse(429, "rate_limit_exceeded", `Amazon Quick's allowance is used up; it resets in ${span(qbs.RECHECK_SECS)} (${error.message})`, {
+    return errorResponse(429, "rate_limit_exceeded", `Amazon Quick's allowance is used up; it resets in ${span(qbs.RECHECK_SECS)}; try again in ${span(qbs.RECHECK_SECS)} (${error.message})`, {
       "retry-after": String(qbs.RECHECK_SECS),
     })
   if (!(error instanceof UpstreamError)) return errorResponse(502, "upstream_error", String(error?.message ?? error))
@@ -148,6 +148,7 @@ export function prepare(body, cfg, threadId, effort = "") {
     parallel,
     bridge: bridgePrompt !== "",
     bridgeAllowed: choice.mode === "function" && choice.name ? new Set([choice.name]) : allowed,
+    schemas: toolSchemas(body),
     stream: body.stream === true,
     includeUsage: body.stream_options?.include_usage === true,
     convo,
@@ -198,6 +199,9 @@ export async function compose(turn, { auth, cfg, session, thread, threadId, sign
   const images = []
   const fresh = turn.convo.slice(thread ? thread.keys.length : 0)
   let blocks = promptBlocks(fresh, { all: turn.convo, images: cfg.attachments && !gateway ? images : undefined })
+  // what was wrong with the calls of the thread's last reply, which the
+  // client may have run anyway
+  if (thread?.problems) blocks = [thread.problems, ...blocks]
   const input = { ...turn.input, threadId, resume: !!thread, prompt: blocks.join("\n\n") }
   const limit = cfg.maxFrameBytes
   const size = () => frameBytes(gateway, userMessage(session, cfg, input))
@@ -205,8 +209,11 @@ export async function compose(turn, { auth, cfg, session, thread, threadId, sign
 
   // the thread keeps the instructions it was given, in the form that
   // fitted: they go again only when the caller's own changed
+  // with tools they go again every so many turns, and after an answer to
+  // tool results that called none: the model may have lost sight of them
   const asked = digest(turn.input.systemPrompt)
-  if (thread && thread.custom === asked) input.systemPrompt = ""
+  const due = turn.bridge && thread && (thread.drifted || (cfg.toolSpecEvery > 0 && thread.since + 1 >= cfg.toolSpecEvery))
+  if (thread && thread.custom === asked && !due) input.systemPrompt = ""
   const instructed = input.systemPrompt !== ""
   if (!fits() && instructed) {
     // a short message is sent whole beside the instructions; a long one
@@ -262,7 +269,25 @@ export async function compose(turn, { auth, cfg, session, thread, threadId, sign
   }
   if (attachments.length) input.attachments = attachments
   if (!fits()) throw new UpstreamError("too_large", `${size()} bytes after shortening, over ${limit}`)
-  return { input, custom: instructed ? asked : thread?.custom ?? "" }
+  return { input, custom: instructed ? asked : thread?.custom ?? "", instructed }
+}
+
+// What a continued thread is told on its next turn: how many turns ago it
+// was given its instructions, whether it answered tool results without a
+// call, and what was wrong with the arguments of the calls it made.
+function afterTurn(turn, thread, composed, text) {
+  if (!turn.bridge) return {}
+  let calls = parseClientToolCalls(text, turn.bridgeAllowed).replies
+  if (!turn.parallel) calls = calls.slice(0, 1)
+  const fresh = turn.convo.slice(thread ? thread.keys.length : 0)
+  const found = calls.flatMap((c) => argumentProblems(c, turn.schemas.get(c.name)).map((p) => `${c.name}: ${p}`))
+  return {
+    since: composed.instructed ? 0 : (thread?.since ?? 0) + 1,
+    drifted: !calls.length && fresh.some((m) => m?.role === "tool"),
+    problems: found.length
+      ? `[Note from my agent: in your last reply, ${found.join("; ")}. Check each call's arguments against the tool's parameters before calling it again.]`
+      : "",
+  }
 }
 
 async function complete(turn, run) {
@@ -450,7 +475,7 @@ export async function chatCompletions({ body, auth, cfg, signal, conversation = 
         })
         // a thread that was told the allowance is used up is not gone on with
         if (usageLimitReply(res.text)) throw new UpstreamError("usage_limit", `it answered "${res.text.trim()}"`)
-        if (cfg.stateful) threads.commit({ id: threadId, account, session: conversation, custom: composed.custom }, keys)
+        if (cfg.stateful) threads.commit({ id: threadId, account, session: conversation, custom: composed.custom, ...afterTurn(turn, thread, composed, res.text) }, keys)
         settle()
         return res
       } catch (e) {

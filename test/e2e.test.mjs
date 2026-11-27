@@ -178,14 +178,14 @@ describe("chat", () => {
       let res = await ask()
       expect(res.status).toBe(429)
       expect(res.headers.get("retry-after")).toBe("2520")
-      expect((await res.json()).error.message).toBe("Amazon Quick's session allowance is used up; it resets in 42m (upstream error: request could not be served)")
+      expect((await res.json()).error.message).toBe("Amazon Quick's session allowance is used up; it resets in 42m; try again in 42m (upstream error: request could not be served)")
 
       // an allowance away for long is asked about again after six hours
       mock.state.usage = { session: { used: 3, limit: 100 }, monthly: { used: 600, limit: 600, resets_at: Math.floor(Date.now() / 1000) + 9 * 86400 } }
       res = await ask()
       expect(res.status).toBe(429)
       expect(res.headers.get("retry-after")).toBe("21600")
-      expect((await res.json()).error.message).toContain("monthly allowance is used up; it resets in 216h 0m")
+      expect((await res.json()).error.message).toContain("monthly allowance is used up; it resets in 216h 0m; try again in 216h 0m")
 
       // with something left, the failure is what it was
       mock.state.usage = null
@@ -206,7 +206,7 @@ describe("chat", () => {
         const res = await post({ model: "smart", stream, messages: [{ role: "user", content: "ping" }] })
         expect(res.status).toBe(429)
         expect(res.headers.get("retry-after")).toBe("1800")
-        expect((await res.json()).error.message).toContain("allowance is used up; it resets in 30m")
+        expect((await res.json()).error.message).toContain("allowance is used up; it resets in 30m; try again in 30m")
         // tried once: a new thread would only hear it again
         expect(mock.state.turns.length).toBe(turns + 1)
       }
@@ -394,6 +394,25 @@ describe("chat", () => {
     expect(await until(() => mock.state.stops.length === before + 1)).toBe(true)
     mock.state.script = null
   })
+
+  test("answers to pings do not keep a turn that writes nothing alive", async () => {
+    const { upstream, settings } = _internal
+    const cfg = { ...settings({}), keepaliveMs: 50, readIdleMs: 400, requestTimeoutMs: 10_000 }
+    const session = upstream.sessionFromAuth(auth, cfg)
+    Object.assign(mock.state, { pong: true, pings: 0, script: () => [] })
+    try {
+      const began = Date.now()
+      await expect(upstream.chat({ session, cfg, input: { prompt: "stuck", model: "smart" } })).rejects.toMatchObject({ kind: "timeout" })
+      expect(Date.now() - began).toBeLessThan(3000)
+      expect(mock.state.pings).toBeGreaterThan(3)
+      // a turn that keeps writing, slower than the read timeout overall, arrives
+      const slow = Array.from({ length: 6 }, (_, i) => [{ wait: 200 }, { type: "text_delta", payload: { delta: `${i}` } }]).flat()
+      mock.state.script = () => [...slow, { type: "message_complete", payload: {} }, { type: "turn_completed", payload: {} }]
+      expect((await upstream.chat({ session, cfg, input: { prompt: "slow", model: "smart" } })).text).toBe("012345")
+    } finally {
+      Object.assign(mock.state, { pong: false, script: null })
+    }
+  })
 })
 
 describe("a conversation over several requests", () => {
@@ -412,7 +431,9 @@ describe("a conversation over several requests", () => {
     await post({ model: "smart", tools, messages }, { headers })
     const two = mock.state.turns.at(-1)
     expect(two.thread_id).toBe(one.thread_id)
-    expect(two.text).toBe(`Tool result (call_id=${call.id}, name=read_file): # Title\n\n${_internal.toolbridge.TOOL_REMINDER}`)
+    // the call left out the required path: the thread is told, with the result
+    const note = `[Note from my agent: in your last reply, read_file: the required argument "path" is missing. Check each call's arguments against the tool's parameters before calling it again.]`
+    expect(two.text).toBe(`${note}\n\nTool result (call_id=${call.id}, name=read_file): # Title\n\n${_internal.toolbridge.TOOL_REMINDER}`)
     // the thread keeps its instructions: they are not sent again
     expect(two.custom_prompt).toBeNull()
 
@@ -421,6 +442,33 @@ describe("a conversation over several requests", () => {
     const three = mock.state.turns.at(-1)
     expect(three).toMatchObject({ thread_id: one.thread_id, text: `more\n\n${_internal.toolbridge.TOOL_REMINDER}` })
     expect(three.custom_prompt).toStartWith("Now be terse.")
+  })
+
+  test("a continued thread with tools is given the whole tool description every six turns", async () => {
+    const h = { headers: { "x-aws-quick-conversation": "s5" } }
+    let messages = [system, { role: "user", content: "hello" }]
+    const sent = []
+    for (let i = 0; i < 7; i++) {
+      const res = await (await post({ model: "smart", tools, messages }, h)).json()
+      sent.push(mock.state.turns.at(-1))
+      messages = [...messages, res.choices[0].message, { role: "user", content: `next ${i}` }]
+    }
+    expect(new Set(sent.map((t) => t.thread_id)).size).toBe(1)
+    expect(sent.map((t) => String(t.custom_prompt ?? "").includes("<client_tool_protocol>"))).toEqual([true, false, false, false, false, false, true])
+  })
+
+  test("an answer to tool results that calls no tool has the description sent again next turn", async () => {
+    const h = { headers: { "x-aws-quick-conversation": "s6" } }
+    const first = await (await post({ model: "smart", tools, messages: [system, ask] }, h)).json()
+    const call = first.choices[0].message.tool_calls[0]
+    const messages = [system, ask, first.choices[0].message, { role: "tool", tool_call_id: call.id, content: "# Title" }]
+    const second = await (await post({ model: "smart", tools, messages }, h)).json()
+    expect(second.choices[0].message.tool_calls).toBeUndefined()
+    expect(mock.state.turns.at(-1).custom_prompt).toBeNull()
+    await post({ model: "smart", tools, messages: [...messages, second.choices[0].message, { role: "user", content: "more" }] }, h)
+    const third = mock.state.turns.at(-1)
+    expect(third).toMatchObject({ thread_id: mock.state.turns.at(-2).thread_id, text: `more\n\n${_internal.toolbridge.TOOL_REMINDER}` })
+    expect(third.custom_prompt).toContain("<client_tool_protocol>")
   })
 
   test("another conversation, or an edited history, starts a new thread", async () => {

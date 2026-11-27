@@ -26,6 +26,44 @@ export function requestedToolNames(body) {
   return new Set(toolDefinitions(body?.tools, body?.functions).map((d) => d.name.trim()))
 }
 
+// The parameters schema of each tool the request offers, by name.
+export function toolSchemas(body) {
+  return new Map(toolDefinitions(body?.tools, body?.functions).map((d) => [d.name.trim(), d.parameters]))
+}
+
+const JSON_TYPES = {
+  string: (v) => typeof v === "string",
+  number: (v) => typeof v === "number",
+  integer: (v) => Number.isInteger(v),
+  boolean: (v) => typeof v === "boolean",
+  array: (v) => Array.isArray(v),
+  object: (v) => !!v && typeof v === "object" && !Array.isArray(v),
+  null: (v) => v === null,
+}
+
+// What is wrong with a call's arguments by its tool's schema: a required
+// one missing, or a top-level one of the wrong type. Only that is checked;
+// the client, which runs the tool, has the last word.
+export function argumentProblems(call, schema) {
+  if (!schema || typeof schema !== "object") return []
+  let args
+  try {
+    args = JSON.parse(call.arguments || "{}")
+  } catch {
+    return ["the arguments are not valid JSON"]
+  }
+  if (!JSON_TYPES.object(args)) return ["the arguments are not a JSON object"]
+  const out = []
+  for (const key of Array.isArray(schema.required) ? schema.required : [])
+    if (typeof key === "string" && !(key in args)) out.push(`the required argument "${key}" is missing`)
+  for (const [key, value] of Object.entries(args)) {
+    const want = schema.properties?.[key]?.type
+    const types = (Array.isArray(want) ? want : [want]).filter((t) => JSON_TYPES[t])
+    if (types.length && !types.some((t) => JSON_TYPES[t](value))) out.push(`"${key}" should be ${types.join(" or ")}, not ${value === null ? "null" : Array.isArray(value) ? "array" : typeof value}`)
+  }
+  return out
+}
+
 export function parseToolChoice(value) {
   if (typeof value === "string") return { mode: value.trim().toLowerCase(), name: "" }
   if (value && typeof value === "object") {

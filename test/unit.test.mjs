@@ -92,6 +92,20 @@ describe("tool bridge", () => {
     expect(toolbridge.parseClientToolCalls(unknown, allowed)).toEqual({ text: unknown, replies: [] })
   })
 
+  test("a call's arguments are checked for required keys and top-level types only", () => {
+    const schema = { type: "object", properties: { path: { type: "string" }, limit: { type: ["integer", "null"] }, tags: { type: "array" }, any: {} }, required: ["path"] }
+    const check = (args) => toolbridge.argumentProblems({ name: "read", arguments: args }, schema)
+    expect(check('{"path":"a","limit":3,"tags":[],"any":1,"extra":true}')).toEqual([])
+    expect(check('{"path":"a","limit":null}')).toEqual([])
+    expect(check('{"limit":"3"}')).toEqual(['the required argument "path" is missing', '"limit" should be integer or null, not string'])
+    expect(check('{"path":["a"],"tags":"x"}')).toEqual(['"path" should be string, not array', '"tags" should be array, not string'])
+    expect(check("[1]")).toEqual(["the arguments are not a JSON object"])
+    expect(check("{oops")).toEqual(["the arguments are not valid JSON"])
+    // what is not a plain type, and a tool without a schema, pass
+    expect(toolbridge.argumentProblems({ arguments: '{"x":1}' }, { properties: { x: { anyOf: [{ type: "string" }] } } })).toEqual([])
+    expect(toolbridge.argumentProblems({ arguments: "{}" }, undefined)).toEqual([])
+  })
+
   test("a call whose closing marker was cut off, and raw newlines in its strings", () => {
     const cut = toolbridge.parseClientToolCalls('Writing it. <client_tool_call>{"name":"get_weather","arguments":{"city":"Pa\nris"}}</client_to', allowed)
     expect(cut.text).toBe("Writing it.")
@@ -299,7 +313,7 @@ describe("requests", () => {
   })
 
   test("options have their defaults", () => {
-    expect(cfg).toMatchObject({ appVersion: "1.2.4660", surface: "QUICK_WORK_DESKTOP_WINDOWS", callbackPort: 18080, requestTimeoutMs: 300000, keepaliveMs: 25000, defaultModel: "smart" })
+    expect(cfg).toMatchObject({ appVersion: "1.2.4660", surface: "QUICK_WORK_DESKTOP_WINDOWS", callbackPort: 18080, requestTimeoutMs: 300000, keepaliveMs: 25000, readIdleMs: 120000, toolSpecEvery: 6, defaultModel: "smart" })
     expect(settings({ request_timeout: "90s", callback_port: 19000, thinking_effort: "HIGH", default_model: "fast" })).toMatchObject({
       requestTimeoutMs: 90000,
       callbackPort: 19000,
