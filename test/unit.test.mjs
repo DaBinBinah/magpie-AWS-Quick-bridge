@@ -92,6 +92,28 @@ describe("tool bridge", () => {
     expect(toolbridge.parseClientToolCalls(unknown, allowed)).toEqual({ text: unknown, replies: [] })
   })
 
+  test("a call whose closing marker was cut off, and raw newlines in its strings", () => {
+    const cut = toolbridge.parseClientToolCalls('Writing it. <client_tool_call>{"name":"get_weather","arguments":{"city":"Pa\nris"}}</client_to', allowed)
+    expect(cut.text).toBe("Writing it.")
+    expect(cut.replies[0]).toMatchObject({ name: "get_weather", arguments: '{"city":"Pa\\nris"}' })
+    expect(toolbridge.parseClientToolCalls('<client_tool_call>{"name":"get_weather","arguments":{"city":"P"}}', allowed).replies).toHaveLength(1)
+    // a brace inside a string does not end the call
+    expect(JSON.parse(toolbridge.parseClientToolCalls('<client_tool_call>{"name":"get_weather","arguments":{"city":"}"}}', allowed).replies[0].arguments)).toEqual({ city: "}" })
+    // cut inside the JSON: nothing to call, the text stays
+    const half = 'ok <client_tool_call>{"name":"get_weather","arguments":{"city":"Pa'
+    expect(toolbridge.parseClientToolCalls(half, allowed)).toEqual({ text: half, replies: [] })
+    // a marker's payload is one JSON value and nothing more
+    const extra = '<client_tool_call>{"name":"get_weather"} trailing</client_tool_call>'
+    expect(toolbridge.parseClientToolCalls(extra, allowed).replies).toEqual([])
+    // the streamed path takes it too
+    const shown = []
+    const stream = new toolbridge.BridgeStream(allowed, (t) => shown.push(t))
+    stream.push("Here. <client_tool_call>")
+    stream.push('{"name":"get_weather","arguments":{}}')
+    expect(stream.finish()).toHaveLength(1)
+    expect(shown.join("")).toBe("Here. ")
+  })
+
   test("bare and fenced JSON are accepted", () => {
     expect(toolbridge.parseClientToolCalls('{"name":"get_weather","arguments":{}}', allowed).replies).toHaveLength(1)
     expect(toolbridge.parseClientToolCalls('```json\n{"tool_calls":[{"name":"get_weather"}]}\n```', allowed).replies[0].arguments).toBe("{}")
@@ -345,6 +367,11 @@ describe("requests", () => {
     expect(thinkingEffort({ reasoning_effort: "minimal" }, "")).toBe("low")
     expect(thinkingEffort({ reasoning: { effort: "xhigh" } }, "")).toBe("high")
     expect(thinkingEffort({}, "medium")).toBe("medium")
+    // magpie's x-magpie-effort header comes first, in its spellings
+    expect(thinkingEffort({ reasoning_effort: "high" }, "", "none")).toBe("off")
+    expect(thinkingEffort({}, "", "med")).toBe("medium")
+    expect(thinkingEffort({}, "", "xhigh")).toBe("high")
+    expect(thinkingEffort({ reasoning_effort: "low" }, "medium", "")).toBe("low")
   })
 
   test("a request is prepared with the bridge prompt and the forced tool", () => {
@@ -379,7 +406,7 @@ describe("requests", () => {
     expect(spentAllowance({ monthly: { used: 601, limit: 600, resets_at: now / 1000 + 90 } }, now)).toEqual({ name: "monthly", secs: 90 })
     expect(spentAllowance({ monthly: { percent: 100, resets_at: "2026-11-23T00:10:00Z" } }, now)).toEqual({ name: "monthly", secs: 600 })
     // Amazon Quick doesn't say when, or says a time that passed
-    expect(spentAllowance({ session: { used: 100, limit: 100 } }, now)).toEqual({ name: "session", secs: 0 })
+    expect(spentAllowance({ session: { used: 100, limit: 100 } }, now)).toEqual({ name: "session", secs: 1800 })
     expect(spentAllowance({ monthly: { used: 600, limit: 600, resets_at: now / 1000 - 5 } }, now)).toEqual({ name: "monthly", secs: 0 })
     // both: the one that is away longer
     const month = { used: 600, limit: 600, resets_at: now / 1000 + 86400 }
@@ -388,6 +415,22 @@ describe("requests", () => {
     expect(spentAllowance({ monthly: month, overage_monthly: { used: 10, limit: 200 } }, now)).toBeNull()
     expect(spentAllowance({ monthly: month, overage_monthly: { used: 200, limit: 200 } }, now)).toEqual({ name: "monthly", secs: 86400 })
     expect(spentAllowance({ monthly: month, overage_monthly: { used: 0, limit: 0 } }, now)).toEqual({ name: "monthly", secs: 86400 })
+  })
+
+  test("the reply that says the allowance is used up", () => {
+    const { usageLimitReply } = _internal
+    expect(usageLimitReply("You've reached your usage limit. Check your profile for details.")).toBe(true)
+    expect(usageLimitReply("  You’ve reached your usage limit.\nCheck your profile for details")).toBe(true)
+    expect(usageLimitReply("You have reached your usage limit. Check your profile for details.")).toBe(true)
+    expect(usageLimitReply("You've reached your usage limit. Check your profile for details. Then try again.")).toBe(false)
+    expect(usageLimitReply("The API says: you've reached your usage limit.")).toBe(false)
+  })
+
+  test("a used-up window without a reset time gets one", () => {
+    const { usageFromProfile } = _internal.qbs
+    const out = usageFromProfile({ session: { used: 100, limit: 100 }, monthly: { used: 10, limit: 600 } })
+    expect(out.windows.find((w) => w.name === "Session").resetSecs).toBe(1800)
+    expect(out.windows.find((w) => w.name === "Monthly").resetSecs).toBeUndefined()
   })
 
   test("usage follows the totals Amazon Quick reports", () => {

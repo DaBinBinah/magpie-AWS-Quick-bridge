@@ -116,21 +116,54 @@ export function buildToolBridgePrompt(tools, functions, mode, name, parallel, de
 export const TOOL_REMINDER =
   '[Note from my agent: the files and the shell this is about are on my own machine. To reach them, write a client tool call as plain text, as my preferences describe: <client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call>. Your built-in tools run on a remote service: they cannot see my machine, and a client tool called through them fails as an unknown tool.]'
 
-function parseEnvelopes(payload) {
-  const text = payload.trim()
-  if (!text) return []
-  let value
-  try {
-    value = JSON.parse(text)
-  } catch {
-    return []
+// The JSON value `text` opens with, read as a model writes it: a newline or
+// tab left raw inside a string is taken as escaped. `end` is where the value
+// ends in `text`; null when no whole value is there.
+export function leadingJson(text) {
+  const start = text.search(/\S/)
+  if (start < 0 || (text[start] !== "{" && text[start] !== "[")) return null
+  const raw = { "\n": "\\n", "\r": "\\r", "\t": "\\t" }
+  let out = ""
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === "\\") escaped = true
+      else if (ch === '"') inString = false
+      out += raw[ch] ?? ch
+      continue
+    }
+    out += ch
+    if (ch === '"') inString = true
+    else if (ch === "{" || ch === "[") depth++
+    else if (ch === "}" || ch === "]") {
+      if (--depth > 0) continue
+      try {
+        return { value: JSON.parse(out), end: i + 1 }
+      } catch {
+        return null
+      }
+    }
   }
+  return null
+}
+
+function envelopesOf(value) {
   if (Array.isArray(value)) return value
   if (value && typeof value === "object") {
     if (Array.isArray(value.tool_calls) && value.tool_calls.length) return value.tool_calls
     return [value]
   }
   return []
+}
+
+// The calls of a marker's payload, which is one JSON value and nothing else.
+function parseEnvelopes(payload) {
+  const found = leadingJson(payload)
+  return found && !payload.slice(found.end).trim() ? envelopesOf(found.value) : []
 }
 
 function repliesFrom(envelopes, allowed) {
@@ -154,7 +187,20 @@ export function extractToolCalls(text, allowed) {
     const start = rest.indexOf(TOOL_OPEN)
     if (start < 0) break
     const end = rest.indexOf(TOOL_CLOSE, start + TOOL_OPEN.length)
-    if (end < 0) break
+    if (end < 0) {
+      // the closing marker is missing, as when the reply ran out of room:
+      // a whole call before it still counts
+      const open = rest.slice(start + TOOL_OPEN.length)
+      const found = leadingJson(open)
+      const calls = found ? repliesFrom(envelopesOf(found.value), allowed) : []
+      if (calls.length) {
+        clean += rest.slice(0, start)
+        replies.push(...calls)
+        const after = open.slice(found.end)
+        rest = after.trim() && TOOL_CLOSE.startsWith(after.trim()) ? "" : after
+      }
+      break
+    }
     clean += rest.slice(0, start)
     replies.push(...repliesFrom(parseEnvelopes(rest.slice(start + TOOL_OPEN.length, end)), allowed))
     rest = rest.slice(end + TOOL_CLOSE.length)

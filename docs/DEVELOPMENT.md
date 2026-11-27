@@ -4,7 +4,7 @@
 
 ## 模型
 
-这些是 Amazon Quick 的 agent mode，不是具体的模型名。我的账号上 fast、balanced、smart 实际分别由 Claude Haiku、Sonnet、Opus 回答（见每轮用量里的 `resolved_model_id`），其他账号可能不同。上下文长度按上游每轮用量里报告的 `context_window` 填为 1M；最大输出（fast 32k，其余 64k）是估计值，Amazon Quick 没有公布。推理档位 low / medium / high 对应上游的 `thinking_effort`。
+这些是 Amazon Quick 的 agent mode，不是具体的模型名。我的账号上 fast、balanced、smart 实际分别由 Claude Haiku、Sonnet、Opus 回答（见每轮用量里的 `resolved_model_id`），其他账号可能不同。上下文长度按上游每轮用量里报告的 `context_window` 填为 1M；最大输出（fast 32k，其余 64k）是估计值，Amazon Quick 没有公布。推理档位 low / medium / high 对应上游的 `thinking_effort`。档位先看 Magpie 的 `x-magpie-effort` 请求头（模型选择器里选的变体），再看请求体的 `reasoning_effort` / `reasoning.effort`；`none`、`disabled` 算 `off`，`minimal` 算 `low`，`med` 算 `medium`，`xhigh`、`max` 算 `high`。
 
 ## 全部选项
 
@@ -183,7 +183,8 @@ m provider test aws-quick
 - Amazon Quick 会在每轮加上它自己的系统提示词和工具（我的账号上一条短消息约占 6.9 万输入 token，大部分命中缓存），插件无法去掉；额度按 Amazon Quick 的 credits 计。
 - 内容转成附件后，模型要先用它自己的文件工具读取，这一轮会慢一些。
 - 线程缓存在插件进程的内存里，Magpie 重启后下一次请求会重发全部历史。
-- 工具桥接是文本协议，模型偶尔可能不遵守；回复以 `{`、`[` 或反引号开头时会先整段缓冲，以判断它是不是一个没带标记的工具调用。
+- 工具桥接是文本协议，模型偶尔可能不遵守；回复以 `{`、`[` 或反引号开头时会先整段缓冲，以判断它是不是一个没带标记的工具调用。缺了 `</client_tool_call>` 但 JSON 完整的调用照常执行；JSON 字符串里没转义的换行、制表符按转义处理。
+- 流式回复的开头如果可能是额度用完的那句话（最多 80 个字符），会先缓冲到能判断为止。
 - 代理：Magpie 会给插件的 `fetch`（登录、续期、查额度）自动加上它的代理，但不管 WebSocket，Bun 的 WebSocket 自己也不读代理环境变量（Bun 1.3.11 和 1.4.5 上实测），所以 0.3.11 及之前登录走代理、聊天直连。现在没填 `proxy` 时，聊天连接读环境变量：先 `MAGPIE_HTTPS_PROXY` / `MAGPIE_ALL_PROXY`（Magpie 把“设置”里的全局代理以这组名字传给插件，实测；SOCKS 代理它会先转成 HTTP 地址），再 `HTTPS_PROXY` / `ALL_PROXY`，大小写都认；`MAGPIE_NO_PROXY` / `NO_PROXY` 里的主机和本机地址不走代理；不是 `http://` 或 `https://` 的代理地址跳过。限制有三条：Magpie 里给单个供应商或账号设的代理不在环境变量里，聊天连接拿不到，要在 `proxy` 选项里再填一次；供应商在 Magpie 里设成“直连”而全局有代理时，把 `proxy` 填成 `direct`；本机 API 用 Node 运行时，Node 的 WebSocket 不接受代理参数，`proxy` 选项和上面这些变量都不起作用，要用 `NODE_USE_ENV_PROXY=1 HTTPS_PROXY=…` 启动它（Node 24 实测）。经过真实代理连 Amazon Quick 我没有测过，只用本地的模拟代理测过。
 - OpenCode 2.x 的入口（`opencode2.mjs`）只通过了 Magpie 社区仓库的检查脚本，没有在 OpenCode 2.x 里实际运行过。
 - 上游接口可能随官方客户端更新而变化；登录或聊天失败时先重新登录，必要时调整 `app_version`。

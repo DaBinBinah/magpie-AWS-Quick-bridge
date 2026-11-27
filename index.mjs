@@ -2,7 +2,7 @@
 // and OpenCode. It signs in with Amazon Quick's own desktop OAuth flow and
 // answers chat completions over Amazon Quick's chat WebSocket.
 
-import { MODES, chatCompletions, compose, errorResponse, failureResponse, mapModel, prepare, thinkingEffort, usageBody } from "./plugin/chat.mjs"
+import { MODES, chatCompletions, compose, errorResponse, failureResponse, mapModel, prepare, thinkingEffort, usageBody, usageLimitReply } from "./plugin/chat.mjs"
 import { browserSignIn } from "./plugin/login.mjs"
 import * as messages from "./plugin/messages.mjs"
 import * as oauth from "./plugin/oauth.mjs"
@@ -185,6 +185,7 @@ const server = async (input, options) => {
               cfg: cfg(),
               signal: init?.signal ?? (request instanceof Request ? request.signal : undefined),
               conversation: threads.conversationOf(headers),
+              effort: headers.get("x-magpie-effort") ?? "",
             })
           },
         }
@@ -196,4 +197,4 @@ const server = async (input, options) => {
 export default { id: "magpie-aws-quick-bridge", server }
 
 // for tests
-export const _internal = { settings, durationMs, models, prepare, compose, mapModel, thinkingEffort, usageBody, failureResponse, chatCompletions, accountModels, threads, messages, oauth, qbs, toolbridge, upstream, wire }
+export const _internal = { settings, durationMs, models, prepare, compose, mapModel, thinkingEffort, usageLimitReply, usageBody, failureResponse, chatCompletions, accountModels, threads, messages, oauth, qbs, toolbridge, upstream, wire }

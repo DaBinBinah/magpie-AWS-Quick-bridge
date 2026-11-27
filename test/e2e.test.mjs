@@ -178,14 +178,14 @@ describe("chat", () => {
       let res = await ask()
       expect(res.status).toBe(429)
       expect(res.headers.get("retry-after")).toBe("2520")
-      expect((await res.json()).error.message).toBe("Amazon Quick's session allowance is used up; it is back in 42 minutes (upstream error: request could not be served)")
+      expect((await res.json()).error.message).toBe("Amazon Quick's session allowance is used up; it resets in 42m (upstream error: request could not be served)")
 
       // an allowance away for long is asked about again after six hours
       mock.state.usage = { session: { used: 3, limit: 100 }, monthly: { used: 600, limit: 600, resets_at: Math.floor(Date.now() / 1000) + 9 * 86400 } }
       res = await ask()
       expect(res.status).toBe(429)
       expect(res.headers.get("retry-after")).toBe("21600")
-      expect((await res.json()).error.message).toContain("monthly allowance is used up; it is back in 216 hours")
+      expect((await res.json()).error.message).toContain("monthly allowance is used up; it resets in 216h 0m")
 
       // with something left, the failure is what it was
       mock.state.usage = null
@@ -195,6 +195,40 @@ describe("chat", () => {
     } finally {
       Object.assign(mock.state, { script: null, usage: null })
     }
+  })
+
+  test("a reply that only says the allowance is used up is a refusal", async () => {
+    const sentence = ["You've reached your ", "usage limit. Check your profile for details."]
+    mock.state.script = () => [...sentence.map((delta) => ({ type: "text_delta", payload: { delta } })), { type: "turn_completed", payload: {} }]
+    try {
+      for (const stream of [false, true]) {
+        const turns = mock.state.turns.length
+        const res = await post({ model: "smart", stream, messages: [{ role: "user", content: "ping" }] })
+        expect(res.status).toBe(429)
+        expect(res.headers.get("retry-after")).toBe("1800")
+        expect((await res.json()).error.message).toContain("allowance is used up; it resets in 30m")
+        // tried once: a new thread would only hear it again
+        expect(mock.state.turns.length).toBe(turns + 1)
+      }
+      // the usage, when it says which one, says for how long
+      mock.state.usage = { session: { used: 100, limit: 100, resume_in_minutes: 42 }, monthly: { used: 1, limit: 600 } }
+      const res = await post({ model: "smart", messages: [{ role: "user", content: "ping" }] })
+      expect(res.headers.get("retry-after")).toBe("2520")
+      // a reply that only starts the same is streamed as it is
+      mock.state.usage = null
+      mock.state.script = () => [...["You've reached ", "the end."].map((delta) => ({ type: "text_delta", payload: { delta } })), { type: "turn_completed", payload: {} }]
+      const events = await sse(await post({ model: "smart", stream: true, messages: [{ role: "user", content: "ping" }] }))
+      expect(events.map((e) => e.choices[0]?.delta?.content ?? "").join("")).toBe("You've reached the end.")
+    } finally {
+      Object.assign(mock.state, { script: null, usage: null })
+    }
+  })
+
+  test("magpie's effort header picks the thinking effort", async () => {
+    await post({ model: "smart", reasoning_effort: "low", messages: [{ role: "user", content: "ping" }] }, { headers: { "x-magpie-effort": "medium" } })
+    expect(mock.state.turns.at(-1).thinking_effort).toBe("medium")
+    await post({ model: "smart", messages: [{ role: "user", content: "ping" }] }, { headers: { "x-magpie-effort": "none" } })
+    expect(mock.state.turns.at(-1).thinking_effort).toBeUndefined()
   })
 
   test("tool_choice none turns the bridge off", async () => {

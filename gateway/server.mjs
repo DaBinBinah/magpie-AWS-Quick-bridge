@@ -102,7 +102,7 @@ export function createGateway({ apiKey, account, options = {}, log = () => {} })
     req.conversation ||= conversationOf(request.headers)
     req.chat.model = quickModel(req.chat.model, cfg.defaultModel)
     log(`${api} ${req.chat.model}${req.chat.stream ? " stream" : ""}`)
-    const ask = (auth) => chatCompletions({ body: req.chat, auth, cfg, signal: request.signal, conversation: String(req.conversation).slice(0, 256) })
+    const ask = (auth) => chatCompletions({ body: req.chat, auth, cfg, signal: request.signal, conversation: String(req.conversation).slice(0, 256), effort: request.headers.get("x-magpie-effort") ?? "" })
     let answer = await ask(auth)
     // Amazon Quick refused the token before its time: renew it and ask once more
     if (answer.status === 401 && answer.headers.get("x-magpie-sign-in") === "expired" && account.renew) {

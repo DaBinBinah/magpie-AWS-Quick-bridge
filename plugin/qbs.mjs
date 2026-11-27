@@ -97,6 +97,16 @@ function isoTime(value) {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : ""
 }
 
+// An allowance that is used up without a time to be back at is asked
+// about again after this long.
+export const RECHECK_SECS = 30 * 60
+
+const usedUp = (q) => {
+  if (!q || typeof q !== "object") return false
+  const limit = Number(q.limit) || 0
+  return limit > 0 ? Number(q.used) >= limit : Number(q.percent) >= 100
+}
+
 function quotaWindow(name, q) {
   if (!q || typeof q !== "object") return null
   const limit = Number(q.limit) || 0
@@ -109,6 +119,8 @@ function quotaWindow(name, q) {
   const resetsAt = isoTime(q.resets_at)
   if (resetsAt) out.resetsAt = resetsAt
   else if (Number(q.resume_in_minutes) > 0) out.resetSecs = Math.round(Number(q.resume_in_minutes) * 60)
+  // magpie holds a full window without a reset time as full for good
+  else if (usedUp(q)) out.resetSecs = RECHECK_SECS
   return out
 }
 
@@ -131,18 +143,15 @@ export function usageFromProfile(raw, auth) {
 export const usage = async (auth, opts) => usageFromProfile(await invoke(auth, "profile/usage", "GET", {}, opts), auth)
 
 // The allowance of profile/usage that is used up, and the seconds until it
-// is there again (0 when Amazon Quick doesn't say); null when none is. A
+// is there again (RECHECK_SECS when Amazon Quick doesn't say, 0 when the
+// time it says has passed); null when none is. A
 // month that is used up still runs while its overage has room.
 export function spentAllowance(raw, now = Date.now()) {
-  const spent = (q) => {
-    if (!q || typeof q !== "object") return false
-    const limit = Number(q.limit) || 0
-    return limit > 0 ? Number(q.used) >= limit : Number(q.percent) >= 100
-  }
+  const spent = usedUp
   const secs = (q) => {
     const at = Date.parse(isoTime(q.resets_at))
     if (Number.isFinite(at)) return Math.max(0, Math.ceil((at - now) / 1000))
-    return Number(q.resume_in_minutes) > 0 ? Math.round(Number(q.resume_in_minutes) * 60) : 0
+    return Number(q.resume_in_minutes) > 0 ? Math.round(Number(q.resume_in_minutes) * 60) : RECHECK_SECS
   }
   const found = []
   if (spent(raw?.session)) found.push({ name: "session", secs: secs(raw.session) })

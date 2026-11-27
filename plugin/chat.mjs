@@ -23,15 +23,27 @@ export function mapModel(model, fallback) {
   return AGENT_MODES.includes(m) ? m : fallback
 }
 
+const EFFORTS = { none: "off", off: "off", disabled: "off", false: "off", minimal: "low", low: "low", med: "medium", medium: "medium" }
+
 // The reasoning effort a request asked for, as Amazon Quick's
-// thinking_effort; the option's value when it asked for none.
-export function thinkingEffort(body, fallback) {
-  const asked = String(body?.reasoning_effort ?? body?.reasoning?.effort ?? "").trim().toLowerCase()
+// thinking_effort; the option's value when it asked for none. magpie's
+// x-magpie-effort header (`header`), the variant picked for the model,
+// comes before the body.
+export function thinkingEffort(body, fallback, header = "") {
+  const asked = String(header || body?.reasoning_effort || body?.reasoning?.effort || "").trim().toLowerCase()
   if (!asked) return fallback
-  if (asked === "none" || asked === "off") return "off"
-  if (asked === "minimal" || asked === "low") return "low"
-  if (asked === "medium") return "medium"
-  return "high"
+  return EFFORTS[asked] ?? "high"
+}
+
+// When an allowance runs out, Amazon Quick may answer a turn with this
+// sentence and nothing else instead of refusing it.
+const USAGE_LIMIT = ["you've reached your usage limit. check your profile for details.", "you have reached your usage limit. check your profile for details."]
+const plainWords = (text) => String(text ?? "").replace(/[‘’]/g, "'").replace(/\s+/g, " ").trim().toLowerCase()
+export const usageLimitReply = (text) => USAGE_LIMIT.some((s) => plainWords(text).replace(/\.?$/, ".") === s)
+// whether a reply that has begun so may still become that sentence
+const mayBeUsageLimit = (text) => {
+  const said = plainWords(text)
+  return said.length <= 80 && USAGE_LIMIT.some((s) => s.startsWith(said))
 }
 
 export function usageBody(u) {
@@ -58,21 +70,29 @@ const THROTTLED = /thrott|rate.?limit|too many requests|quota|limit exceeded|cap
 // changed meanwhile.
 const REST_MAX_SECS = 6 * 3600
 
-const span = (secs) => (secs >= 5400 ? `${Math.round(secs / 3600)} hours` : `${Math.max(1, Math.round(secs / 60))} minutes`)
+// as "3h 32m", the words magpie reads a reset time from
+const span = (secs) => {
+  const mins = Math.max(1, Math.ceil(secs / 60))
+  return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`
+}
 
 // Whether a failed turn is one Amazon Quick refused itself, which it also
 // does when an allowance is used up, in words that are not known.
-export const refused = (error) => error instanceof UpstreamError && (error.kind === "upstream" || (error.kind === "handshake" && error.status === 429))
+export const refused = (error) => error instanceof UpstreamError && (error.kind === "upstream" || error.kind === "usage_limit" || (error.kind === "handshake" && error.status === 429))
 
 // The answer for a turn that failed before anything was sent. `spent` is
 // the account's used-up allowance (qbs.spentAllowance), when it has one.
 export function failureResponse(error, spent = null) {
   if (spent && refused(error)) {
-    const back = spent.secs > 0 ? `; it is back in ${span(spent.secs)}` : ""
+    const back = spent.secs > 0 ? `; it resets in ${span(spent.secs)}` : ""
     return errorResponse(429, "rate_limit_exceeded", `Amazon Quick's ${spent.name} allowance is used up${back} (${error.message})`, {
       ...(spent.secs > 0 ? { "retry-after": String(Math.min(spent.secs, REST_MAX_SECS)) } : {}),
     })
   }
+  if (error instanceof UpstreamError && error.kind === "usage_limit")
+    return errorResponse(429, "rate_limit_exceeded", `Amazon Quick's allowance is used up; it resets in ${span(qbs.RECHECK_SECS)} (${error.message})`, {
+      "retry-after": String(qbs.RECHECK_SECS),
+    })
   if (!(error instanceof UpstreamError)) return errorResponse(502, "upstream_error", String(error?.message ?? error))
   if (error.kind === "handshake" && error.status === 401)
     return errorResponse(401, "upstream_session_unavailable", `Amazon Quick refused the sign-in; sign in again (${error.message})`, {
@@ -97,7 +117,7 @@ const wireToolCall = (r, index) => ({
 
 // Reads a chat completions body into what one upstream turn needs. `input`
 // is the turn as a new thread would get it, before it is fitted to a frame.
-export function prepare(body, cfg, threadId) {
+export function prepare(body, cfg, threadId, effort = "") {
   if (!body || typeof body !== "object") throw new Error("the request body is not a JSON object")
   if (Number(body.n) > 1) throw new Error("n > 1 is not supported")
   const messages = Array.isArray(body.messages) ? body.messages : []
@@ -141,7 +161,7 @@ export function prepare(body, cfg, threadId) {
       title: titleFor(lastUserText(messages)),
       systemPrompt: custom(bridgePrompt),
       reminder: bridgePrompt ? TOOL_REMINDER : "",
-      thinkingEffort: thinkingEffort(body, cfg.thinkingEffort),
+      thinkingEffort: thinkingEffort(body, cfg.thinkingEffort, effort),
       webSearch: typeof body.web_search_enabled === "boolean" ? body.web_search_enabled : cfg.webSearch === true,
     },
   }
@@ -315,10 +335,27 @@ function stream(turn, run, abort, headerWaitMs = 0) {
     closed = true
   }
 
+  // a reply that may still be the used-up allowance's sentence is held
+  // back until it is known not to be
   let sawText = false
-  const text = (t) => {
+  let held = ""
+  let holding = true
+  const write = (t) => {
     sawText = true
     chunk({ content: t })
+  }
+  const text = (t) => {
+    if (holding) {
+      held += t
+      if (mayBeUsageLimit(held)) return
+      ;[t, held, holding] = [held, "", false]
+    }
+    write(t)
+  }
+  const release = () => {
+    holding = false
+    if (held) write(held)
+    held = ""
   }
   const bridge = turn.bridge ? new BridgeStream(turn.bridgeAllowed, text) : null
 
@@ -331,6 +368,7 @@ function stream(turn, run, abort, headerWaitMs = 0) {
   })
     .then((res) => {
       let calls = bridge ? bridge.finish() : []
+      release()
       if (!turn.parallel) calls = calls.slice(0, 1)
       if (!sawText && !calls.length) throw new UpstreamError("upstream", "upstream returned no text or tool calls")
       calls.forEach((c, i) => chunk({ tool_calls: [wireToolCall(c, i)] }))
@@ -359,10 +397,10 @@ function stream(turn, run, abort, headerWaitMs = 0) {
 // Answers one POST /chat/completions for the account `auth`. `conversation`
 // is the caller's id for the conversation, when it gives one: requests of
 // different conversations never share a thread.
-export async function chatCompletions({ body, auth, cfg, signal, conversation = "" }) {
+export async function chatCompletions({ body, auth, cfg, signal, conversation = "", effort = "" }) {
   let turn
   try {
-    turn = prepare(body, cfg)
+    turn = prepare(body, cfg, undefined, effort)
     if (!turn.convo.length) throw new Error("messages must not be empty")
   } catch (e) {
     return errorResponse(400, "invalid_request_error", e.message)
@@ -410,6 +448,8 @@ export async function chatCompletions({ body, auth, cfg, signal, conversation = 
           composed = await compose(turn, { auth, cfg: smaller, session, thread, threadId, signal: abort.signal })
           return send(composed.input, onEvent)
         })
+        // a thread that was told the allowance is used up is not gone on with
+        if (usageLimitReply(res.text)) throw new UpstreamError("usage_limit", `it answered "${res.text.trim()}"`)
         if (cfg.stateful) threads.commit({ id: threadId, account, session: conversation, custom: composed.custom }, keys)
         settle()
         return res
@@ -428,7 +468,7 @@ export async function chatCompletions({ body, auth, cfg, signal, conversation = 
     } catch (e) {
       // a thread Amazon Quick no longer takes: the conversation starts a
       // new one, sent whole
-      if (!thread || signal?.aborted || (e instanceof UpstreamError && e.kind === "handshake")) throw e
+      if (!thread || signal?.aborted || (e instanceof UpstreamError && (e.kind === "handshake" || e.kind === "usage_limit"))) throw e
       return await attempt(null)
     }
   } catch (e) {
