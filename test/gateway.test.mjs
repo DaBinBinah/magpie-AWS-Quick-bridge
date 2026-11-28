@@ -377,3 +377,53 @@ describe("CC Switch", () => {
     expect(text).toContain("<string>serve</string>")
   })
 })
+
+describe("images and documents in what a client sends", () => {
+  const png = Buffer.from("png bytes").toString("base64")
+  const pdf = Buffer.from("%PDF-1.4 report").toString("base64")
+
+  test("Claude Code's tool results and documents go as attachments", async () => {
+    const res = await call("/v1/messages", {
+      model: "smart",
+      max_tokens: 100,
+      messages: [
+        { role: "user", content: "look at the screenshot" },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/s.png" } }] },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_1", content: [{ type: "text", text: "read it" }, { type: "image", source: { type: "base64", media_type: "image/png", data: png } }] },
+            { type: "document", title: "Q3 report", source: { type: "base64", media_type: "application/pdf", data: pdf } },
+            { type: "document", source: { type: "text", media_type: "text/plain", data: "plain notes" } },
+            { type: "text", text: "what do they say?" },
+          ],
+        },
+      ],
+    })
+    expect(res.status).toBe(200)
+    const turn = mock.state.turns.at(-1)
+    expect(turn.text).toContain("read it\n[image: attached file image_1.png]")
+    expect(turn.text).toContain("[file: attached file Q3 report.pdf]\nplain notes\nwhat do they say?")
+    expect(turn.attachments.map((a) => [a.type, a.name, a.mimeType])).toEqual([
+      ["image", "image_1.png", "image/png"],
+      ["file", "Q3 report.pdf", "application/pdf"],
+    ])
+    expect(mock.state.uploads.at(-1)).toMatchObject({ name: "Q3 report.pdf", contentType: "application/pdf", text: "%PDF-1.4 report" })
+  })
+
+  test("Codex's files and the images its tools return go as attachments", async () => {
+    const res = await call("/v1/responses", {
+      model: "smart",
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: "check " }, { type: "input_file", filename: "spec.pdf", file_data: `data:application/pdf;base64,${pdf}` }] },
+        { type: "function_call", call_id: "call_1", name: "view_image", arguments: "{}" },
+        { type: "function_call_output", call_id: "call_1", output: [{ type: "input_image", image_url: `data:image/png;base64,${png}` }] },
+      ],
+    })
+    expect(res.status).toBe(200)
+    const turn = mock.state.turns.at(-1)
+    expect(turn.text).toContain("check [file: attached file spec.pdf]")
+    expect(turn.text).toContain("[image: attached file image_2.png]")
+    expect(turn.attachments.map((a) => a.name)).toEqual(["spec.pdf", "image_2.png"])
+  })
+})

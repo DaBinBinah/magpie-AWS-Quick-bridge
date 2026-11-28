@@ -21,16 +21,36 @@ function image(block) {
   return null
 }
 
-function resultText(block) {
-  const parts = typeof block.content === "string" ? [block.content] : []
-  for (const p of Array.isArray(block.content) ? block.content : []) {
-    if (p?.type === "text" && typeof p.text === "string") parts.push(p.text)
-    else if (p?.type === "image") parts.push("[image]")
-    else if (p?.type === "tool_reference" && p.tool_name) parts.push(`Tool loaded: ${p.tool_name}`)
-  }
-  const text = parts.join("\n")
-  return block.is_error && !/^error/i.test(text) ? `Error: ${text}`.trim() : text
+// A document block as a chat file part (PDF, or text given as base64 or
+// by address), or as its text.
+function document(block) {
+  const s = block?.source
+  const title = typeof block?.title === "string" ? block.title.trim() : ""
+  if (s?.type === "base64" && s.data) return { type: "file", file: { filename: title, file_data: `data:${s.media_type || "application/pdf"};base64,${s.data}` } }
+  if (s?.type === "url" && s.url) return { type: "file", file: { filename: title, file_url: s.url } }
+  const text = s?.type === "text" ? s.data : s?.type === "content" ? textOf(typeof s.content === "string" ? [{ type: "text", text: s.content }] : s.content) : ""
+  if (typeof text === "string" && text) return { type: "text", text: title ? `${title}:\n${text}` : text }
+  return { type: "text", text: `[document${title ? ` ${title}` : ""}]` }
 }
+
+// A tool result as chat content: its text, with the images and documents
+// in it kept as parts of their own.
+function resultContent(block) {
+  const parts = typeof block.content === "string" ? [{ type: "text", text: block.content }] : []
+  for (const p of Array.isArray(block.content) ? block.content : []) {
+    if (p?.type === "text" && typeof p.text === "string") parts.push({ type: "text", text: p.text })
+    else if (p?.type === "image") parts.push(image(p) ?? { type: "text", text: "[image]" })
+    else if (p?.type === "document") parts.push(document(p))
+    else if (p?.type === "tool_reference" && p.tool_name) parts.push({ type: "text", text: `Tool loaded: ${p.tool_name}` })
+  }
+  const text = parts.map((p) => (p.type === "text" ? p.text : "")).join("\n")
+  const failed = block.is_error && !/^error/i.test(text)
+  if (parts.every((p) => p.type === "text")) return failed ? `Error: ${text}`.trim() : text
+  return failed ? [{ type: "text", text: "Error: " }, ...lines(parts)] : lines(parts)
+}
+
+// Parts with a line break between each two, as text alone is joined.
+const lines = (parts) => parts.flatMap((p, i) => (i ? [{ type: "text", text: "\n" }, p] : [p]))
 
 function messages(list) {
   const out = []
@@ -52,14 +72,14 @@ function messages(list) {
       continue
     }
     // a turn's tool results come before what the user wrote after them
-    for (const b of blocks) if (b?.type === "tool_result") out.push({ role: "tool", tool_call_id: String(b.tool_use_id ?? ""), content: resultText(b) })
+    for (const b of blocks) if (b?.type === "tool_result") out.push({ role: "tool", tool_call_id: String(b.tool_use_id ?? ""), content: resultContent(b) })
     const parts = []
     for (const b of blocks) {
       if (b?.type === "text" && typeof b.text === "string") parts.push({ type: "text", text: b.text })
       else if (b?.type === "image") parts.push(image(b) ?? { type: "text", text: "[image]" })
-      else if (b?.type === "document") parts.push({ type: "text", text: `[document${b.title ? ` ${b.title}` : ""}]` })
+      else if (b?.type === "document") parts.push(document(b))
     }
-    if (parts.length) out.push({ role: "user", content: parts.every((p) => p.type === "text") ? parts.map((p) => p.text).join("\n") : parts })
+    if (parts.length) out.push({ role: "user", content: parts.every((p) => p.type === "text") ? parts.map((p) => p.text).join("\n") : lines(parts) })
   }
   return out
 }

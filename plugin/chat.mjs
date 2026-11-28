@@ -4,6 +4,7 @@
 // status magpie can act on.
 
 import { UPSTREAM_PROMPT_OVERRIDE, isSystemMessage, languageNote, lastUserText, promptBlocks, systemText, titleFor, uuid } from "./messages.mjs"
+import * as files from "./files.mjs"
 import * as qbs from "./qbs.mjs"
 import { ThreadStore, digest, messageKey } from "./threads.mjs"
 import { BridgeStream, TOOL_DETAILS, TOOL_REMINDER, argumentProblems, buildToolBridgePrompt, parseClientToolCalls, parseToolChoice, requestedToolNames, toolSchemas } from "./toolbridge.mjs"
@@ -193,12 +194,16 @@ function longestFit(text, fits) {
 // continued one (`thread`) the messages that are new. It is made to fit one
 // message: the tools are described more briefly, then the instructions are
 // shortened, then what is too long goes into an attachment the model is told
-// to read, and where that cannot be done the oldest parts are cut.
-export async function compose(turn, { auth, cfg, session, thread, threadId, signal, upload = qbs.upload }) {
+// to read, and where that cannot be done the oldest parts are cut. Images
+// and files of the new messages are attached, those given by address
+// downloaded first.
+export async function compose(turn, { auth, cfg, session, thread, threadId, signal, upload = qbs.upload, download = files.download }) {
   const gateway = isGatewayProvider(session.provider)
-  const images = []
-  const fresh = turn.convo.slice(thread ? thread.keys.length : 0)
-  let blocks = promptBlocks(fresh, { all: turn.convo, images: cfg.attachments && !gateway ? images : undefined })
+  const attachable = cfg.attachments && !gateway
+  const found = []
+  let fresh = turn.convo.slice(thread ? thread.keys.length : 0)
+  if (attachable) fresh = await files.fetchRemote(fresh, { signal, download })
+  let blocks = promptBlocks(fresh, { all: turn.convo, files: attachable ? found : undefined })
   // what was wrong with the calls of the thread's last reply, which the
   // client may have run anyway
   if (thread?.problems) blocks = [thread.problems, ...blocks]
@@ -260,9 +265,9 @@ export async function compose(turn, { auth, cfg, session, thread, threadId, sign
     if (!set()) blocks[0] = longestFit(blocks[0], (cut) => ((blocks[0] = cut), set()))
     set()
   }
-  for (const image of images.slice(0, 10)) {
+  for (const file of found.slice(-10)) {
     try {
-      await attach(image.name, image.mimeType, Buffer.from(image.base64, "base64"))
+      await attach(file.name, file.mimeType, Buffer.from(file.base64, "base64"))
     } catch (e) {
       if (signal?.aborted) throw e
     }

@@ -27,7 +27,7 @@ magpie plugin options magpie-AWS-Quick-bridge '{"thinking_effort": "medium", "ti
 | `keep_sessions` | `false` | 对话进入 Amazon Quick 的聊天列表和记忆，而不是使用隐身线程（也可在供应商编辑页的插件选项里开关） |
 | `web_search` | `false` | 允许 Amazon Quick 使用它自己的联网搜索；请求里的 `web_search_enabled` 优先 |
 | `stateful` | `true` | 多轮对话复用服务端线程、只发新增消息；`false` 时每次请求重发全部历史 |
-| `attachments` | `true` | 放不进一帧的内容和图片上传为附件；`false` 时改为截断较早的内容 |
+| `attachments` | `true` | 放不进一帧的内容、图片和 PDF 等文件上传为附件，图片地址先下载；`false` 时不上传，改为截断较早的内容，文件只发占位 |
 | `max_frame_bytes` | `63000` | 一条消息（JSON，UTF-8 字节）的大小上限，超过就压缩或转附件；`0` 关闭这项处理 |
 | `app_version` | `1.2.4660` | 上游握手使用的 appVersion |
 | `surface` | `QUICK_WORK_DESKTOP_WINDOWS` | 上游握手使用的 surfaceType |
@@ -103,6 +103,7 @@ plugin/login.mjs     本机回调端口上的浏览器登录
 plugin/upstream.mjs  一轮对话的 WebSocket 收发
 plugin/wire.mjs      AIDP / Gateway 帧、AWS event-stream、CBOR
 plugin/qbs.mjs       账号接口：额度、设置、附件上传
+plugin/files.mjs     对话里的图片和文件：识别类型、安全下载图片地址
 plugin/threads.mjs   请求与服务端线程的对应关系
 plugin/messages.mjs  OpenAI 消息 → user_message 文本与 custom_prompt
 plugin/toolbridge.mjs 客户端工具的文本协议与流式解析
@@ -181,7 +182,9 @@ m provider test aws-quick
 - **真实上游的验证范围**：我用自己的个人账号（social）对真实的 Amazon Quick 验证过浏览器登录、流式对话、系统提示词、思考输出、工具调用循环、线程复用、附件上传和额度查询；0.3.3 的中文日志搜索（Claude Code 的 `fast` 和默认档、Codex、Chat Completions）和带 `[1m]` 后缀的模型名也是对真实账号验证的。企业账号（IAM Identity Center）、`gateway` / `social_gateway` 的 CBOR 路径、advanced 模式和图片附件只对仓库里的模拟上游或单元测试验证过。在 Magpie 里的安装、登录、粘贴回调登录、经网关请求和 `magpie quota` 是对模拟上游验证的。
 - **CC Switch 模式的验证范围**：在我的 Mac 上用真实账号让 Claude Code、Codex、OpenCode 经本机 API 完成了读文件、写文件的工具调用；企业账号登录和 macOS 后台服务没有用真实账号验证。Gemini CLI 用的是另一种接口格式，目前不支持。
 - 只有聊天。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 返回 400。
-- 输入是文本和 `data:` URL 形式的图片；远程图片地址、音频、文件会变成 `[image]`、`[audio]`、`[file]` 占位。
+- 图片（PNG、JPEG、GIF、WebP）、PDF 和纯文本类文件（txt、md、csv）上传为附件，在正文里写成 `[image: attached file 名字]` / `[file: attached file 名字]`；每轮最多 10 个，取最新的。来源包括消息里的 `data:` 数据、工具结果里的图片和文件、Anthropic 的 `document` 块和 OpenAI Responses 的 `input_file`。
+- `http(s)` 地址的图片和文件先下载再上传（`plugin/files.mjs`）：只下载 http 和 https，最大 10 MB，20 秒超时；主机名解析出的地址只要有一个是本机、内网、链路本地或保留地址就拒绝，每次重定向都重新检查，最多 3 次。下载失败时保留原地址作为文字。DNS 检查和真正连接之间仍有极短的间隔，不能完全防住 DNS 重绑定。
+- Gateway 账号不支持附件：不下载，文件只发占位。音频仍是 `[audio]` 占位。
 - Amazon Quick 会在每轮加上它自己的系统提示词和工具（我的账号上一条短消息约占 6.9 万输入 token，大部分命中缓存），插件无法去掉；额度按 Amazon Quick 的 credits 计。
 - 内容转成附件后，模型要先用它自己的文件工具读取，这一轮会慢一些。
 - 线程缓存在插件进程的内存里，Magpie 重启后下一次请求会重发全部历史。

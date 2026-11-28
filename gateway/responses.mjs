@@ -20,7 +20,12 @@ function content(value) {
     else if (p?.type === "input_image") {
       const url = typeof p.image_url === "string" ? p.image_url : p.image_url?.url
       parts.push(url ? { type: "image_url", image_url: { url } } : { type: "text", text: "[image]" })
-    } else if (p?.type === "input_file") parts.push({ type: "text", text: `[file${p.filename ? ` ${p.filename}` : ""}]` })
+    } else if (p?.type === "input_file") {
+      const filename = typeof p.filename === "string" ? p.filename : ""
+      const data = typeof p.file_data === "string" && p.file_data ? p.file_data : ""
+      const url = typeof p.file_url === "string" && p.file_url ? p.file_url : ""
+      parts.push(data || url ? { type: "file", file: { filename, ...(data ? { file_data: data } : { file_url: url }) } } : { type: "text", text: `[file${filename ? ` ${filename}` : ""}]` })
+    }
   }
   return parts.every((p) => p.type === "text") ? parts.map((p) => p.text).join("\n") : parts
 }
@@ -29,7 +34,17 @@ function content(value) {
 // under one name, as chat tools have no namespaces.
 const flat = (namespace, name) => (namespace ? `${namespace}${namespace.endsWith("__") ? "" : "__"}${name}` : String(name ?? ""))
 
-const output = (value) => (typeof value === "string" ? value : Array.isArray(value) ? textOf(value, TEXT) || JSON.stringify(value) : value == null ? "" : JSON.stringify(value))
+const MEDIA = ["input_image", "input_file"]
+const output = (value) =>
+  typeof value === "string"
+    ? value
+    : Array.isArray(value)
+      ? value.some((p) => MEDIA.includes(p?.type))
+        ? content(value)
+        : textOf(value, TEXT) || JSON.stringify(value)
+      : value == null
+        ? ""
+        : JSON.stringify(value)
 
 // The `input` items as chat messages. A model's tool calls are items of
 // their own here; in chat they hang off the assistant message before them.

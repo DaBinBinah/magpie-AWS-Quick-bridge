@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { _internal } from "../index.mjs"
+import * as files from "../plugin/files.mjs"
 
 const { wire, messages, toolbridge, oauth, prepare, mapModel, thinkingEffort, usageBody, settings, durationMs } = _internal
 
@@ -553,5 +554,109 @@ describe("the proxy of a chat WebSocket", () => {
     expect(proxyFor(WSS, {}, { ...env, no_proxy: "*" })).toBe("")
     expect(proxyFor(WSS, {}, { ...env, NO_PROXY: "aws.co,uick.aws.com" })).toBe(P)
     expect(proxyFor(WSS, {}, { ...env, NO_PROXY: "T1.US-EAST-1.ENTERPRISE.QUICK.AWS.COM" })).toBe("")
+  })
+})
+
+describe("files a conversation carries", () => {
+  const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 1, 2, 3])
+  const PDF = new TextEncoder().encode("%PDF-1.4 x")
+  const pdf = `data:application/pdf;base64,${Buffer.from(PDF).toString("base64")}`
+  const served = (bytes, headers = {}, status = 200) => new Response(bytes, { status, headers: { "content-type": "image/png", ...headers } })
+  const resolve = async (host) => [{ address: { "img.example": "93.184.216.34", "inside.example": "10.0.0.5", "both.example": "93.184.216.34" }[host] ?? "8.8.8.8" }].concat(host === "both.example" ? [{ address: "127.0.0.1" }] : [])
+
+  test("a file part with data is attached under its own name, and named in the text", () => {
+    const found = []
+    const text = messages.contentText([{ type: "text", text: "read " }, { type: "file", file: { filename: "../report.pdf", file_data: pdf } }], found)
+    expect(text).toBe("read [file: attached file report.pdf]")
+    expect(found).toEqual([{ name: "report.pdf", mimeType: "application/pdf", base64: Buffer.from(PDF).toString("base64") }])
+    const again = messages.contentText([{ type: "file", file: { filename: "report.pdf", file_data: pdf } }], found)
+    expect(again).toBe("[file: attached file 2_report.pdf]")
+    expect(messages.contentText([{ type: "file", file: { filename: "report.pdf", file_data: pdf } }])).toBe("[file report.pdf]")
+    expect(messages.contentText([{ type: "file", file: { file_data: "data:application/zip;base64,UEsDBA==" } }], [])).toBe("[file]")
+  })
+
+  test("addresses on this machine or its network count as private", () => {
+    for (const ip of ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "::1", "::", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "::ffff:7f00:1", "64:ff9b::a00:1", "localhost"])
+      expect([ip, files.privateAddress(ip)]).toEqual([ip, true])
+    for (const ip of ["93.184.216.34", "8.8.8.8", "198.18.0.100", "2606:4700::1111", "[2001:4860:4860::8888]"]) expect([ip, files.privateAddress(ip)]).toEqual([ip, false])
+  })
+
+  test("an image given by address is downloaded, its kind read from its bytes", async () => {
+    const got = await files.download("https://img.example/a", { resolve, fetch: async () => served(PNG, { "content-type": "application/octet-stream" }) })
+    expect(got.mimeType).toBe("image/png")
+    expect([...got.bytes]).toEqual([...PNG])
+  })
+
+  test("only http(s) addresses away from this machine and its network are downloaded", async () => {
+    let fetched = 0
+    const fetch = async () => (fetched++, served(PNG))
+    for (const url of ["file:///etc/passwd", "ftp://img.example/a.png", "http://localhost/a.png", "http://app.localhost/a.png", "http://127.0.0.1/a.png", "http://[::1]/a.png", "http://169.254.169.254/latest", "http://inside.example/a.png", "http://both.example/a.png"])
+      await expect(files.download(url, { resolve, fetch })).rejects.toThrow()
+    expect(fetched).toBe(0)
+  })
+
+  test("a redirect is checked again before it is followed", async () => {
+    const asked = []
+    const fetch = async (url) => (asked.push(String(url)), String(url).includes("img.example") ? new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest/meta-data" } }) : served(PNG))
+    await expect(files.download("https://img.example/a", { resolve, fetch })).rejects.toThrow(/network/)
+    expect(asked).toEqual(["https://img.example/a"])
+    const ok = async (url) => (String(url).includes("/a") ? new Response(null, { status: 301, headers: { location: "/b.png" } }) : served(PNG))
+    expect((await files.download("https://img.example/a", { resolve, fetch: ok })).mimeType).toBe("image/png")
+  })
+
+  test("more than 10 MB, or something that is not an image, is not taken", async () => {
+    const big = new Uint8Array(files.REMOTE_MAX_BYTES + 1)
+    big.set(PNG)
+    await expect(files.download("https://img.example/a", { resolve, fetch: async () => served(big) })).rejects.toThrow(/10 MB/)
+    const unsized = () => new Response(new ReadableStream({ start: (c) => (c.enqueue(big), c.close()) }), { headers: { "content-type": "image/png" } })
+    await expect(files.download("https://img.example/a", { resolve, fetch: async () => unsized() })).rejects.toThrow(/10 MB/)
+    await expect(files.download("https://img.example/a", { resolve, fetch: async () => served("<html>", { "content-type": "text/html" }) })).rejects.toThrow(/attached/)
+    await expect(files.download("https://img.example/a", { resolve, fetch: async () => served(PDF), accept: files.isImage })).rejects.toThrow(/attached/)
+    await expect(files.download("https://img.example/a", { resolve, fetch: async () => served("", {}, 404) })).rejects.toThrow(/404/)
+  })
+
+  describe("in what is sent", () => {
+    const cfg = settings({})
+    const uploaded = []
+    const send = (provider, content, download) => {
+      const turn = prepare({ model: "smart", messages: [{ role: "user", content }] }, cfg, "t")
+      const session = _internal.upstream.sessionFromAuth({ idToken: "x", wsHost: "h", quickProvider: provider }, cfg)
+      return _internal.compose(turn, {
+        auth: {},
+        cfg,
+        session,
+        thread: null,
+        threadId: "00000000-0000-0000-0000-000000000000",
+        download,
+        upload: async (_, file) => (uploaded.push(file), { type: file.mimeType.startsWith("image/") ? "image" : "file", name: file.name }),
+      })
+    }
+
+    test("an image given by address goes as an attachment; one that cannot be had stays an address", async () => {
+      const download = async (url) => {
+        if (url.includes("gone")) throw new Error("HTTP 404")
+        return { mimeType: "image/png", bytes: PNG }
+      }
+      const content = [{ type: "text", text: "compare " }, { type: "image_url", image_url: { url: "https://img.example/a.png" } }, { type: "image_url", image_url: "https://img.example/gone.png" }]
+      const out = await send("social", content, download)
+      expect(out.input.prompt).toBe("compare [image: attached file image_1.png][image: https://img.example/gone.png]")
+      expect(out.input.attachments).toEqual([{ type: "image", name: "image_1.png" }])
+      expect([...uploaded.at(-1).bytes]).toEqual([...PNG])
+    })
+
+    test("a file given by address is downloaded under its own name", async () => {
+      const out = await send("social", [{ type: "file", file: { file_url: "https://docs.example/q3%20plan.pdf" } }], async () => ({ mimeType: "application/pdf", bytes: PDF }))
+      expect(out.input.prompt).toBe("[file: attached file q3 plan.pdf]")
+      expect(uploaded.at(-1)).toMatchObject({ name: "q3 plan.pdf", mimeType: "application/pdf" })
+    })
+
+    test("a Gateway account downloads nothing and attaches nothing", async () => {
+      let downloads = 0
+      const content = [{ type: "image_url", image_url: { url: "https://img.example/a.png" } }, { type: "file", file: { filename: "r.pdf", file_data: pdf } }]
+      const out = await send("gateway", content, async () => (downloads++, { mimeType: "image/png", bytes: PNG }))
+      expect(downloads).toBe(0)
+      expect(out.input.attachments).toBeUndefined()
+      expect(out.input.prompt).toBe("[image: https://img.example/a.png][file r.pdf]")
+    })
   })
 })

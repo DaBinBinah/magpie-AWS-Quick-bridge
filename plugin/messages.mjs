@@ -2,6 +2,7 @@
 // aws-quickwork-2api's internal/proxy/messages.go.
 
 import { randomUUID } from "node:crypto"
+import { dataFile, fileName, isImage } from "./files.mjs"
 
 export const uuid = () => randomUUID()
 export const callId = () => "call_" + uuid().replaceAll("-", "")
@@ -26,13 +27,11 @@ function imagePartURL(part) {
   return ""
 }
 
-const IMAGE_EXT = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" }
-
 // Flattens an OpenAI content field into text. Non-text parts become short
-// markers so the upstream still knows they were present. With `images`, an
-// inline image is added to it (to be sent as an attachment) and named in
-// the text.
-export function contentText(content, images) {
+// markers so the upstream still knows they were present. With `files`, an
+// inline image or file is added to it (to be sent as an attachment) and
+// named in the text.
+export function contentText(content, files) {
   if (typeof content === "string") return content
   if (content === null || content === undefined) return ""
   if (!Array.isArray(content)) {
@@ -60,26 +59,35 @@ export function contentText(content, images) {
         break
       case "image_url": {
         const url = imagePartURL(part)
-        const data = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/is.exec(url)
-        if (data && images && IMAGE_EXT[data[1].toLowerCase()]) {
-          const mimeType = data[1].toLowerCase()
-          const name = `image_${images.length + 1}.${IMAGE_EXT[mimeType]}`
-          images.push({ name, mimeType, base64: data[2] })
-          out += `[image: attached file ${name}]`
-        } else out += url && !url.startsWith("data:") ? `[image: ${url}]` : "[image]"
+        const data = url.startsWith("data:") ? dataFile(url) : null
+        if (data && files && isImage(data.mimeType)) out += `[image: attached file ${attach(files, data, "", "image")}]`
+        else out += url && !url.startsWith("data:") ? `[image: ${url}]` : "[image]"
         break
       }
       case "input_audio":
         out += "[audio]"
         break
-      case "file":
-        out += "[file]"
+      case "file": {
+        const f = part.file && typeof part.file === "object" ? part.file : {}
+        const label = typeof f.filename === "string" ? f.filename.trim() : ""
+        const data = dataFile(f.file_data, label)
+        if (data && files) out += `[file: attached file ${attach(files, data, label, "file")}]`
+        else out += `[file${label ? ` ${label}` : typeof f.file_url === "string" && /^https?:/i.test(f.file_url) ? ` ${f.file_url}` : ""}]`
         break
+      }
       default:
         out += typeof part.text === "string" ? part.text : JSON.stringify(part)
     }
   }
   return out
+}
+
+// Adds a file to `files` under a name no other file there has; the name.
+function attach(files, { mimeType, base64 }, wanted, kind) {
+  let name = fileName(wanted, mimeType, `${kind}_${files.length + 1}`)
+  if (files.some((f) => f.name === name)) name = `${files.length + 1}_${name}`
+  files.push({ name, mimeType, base64 })
+  return name
 }
 
 function roleLabel(role) {
@@ -95,7 +103,7 @@ const isSystem = (role) => role === "system" || role === "developer"
 // and results are rendered explicitly so the upstream model can follow a
 // client-side tool loop. `all` is the whole conversation when `messages` is
 // only its newest part (tool results are named after the calls in it).
-export function promptBlocks(messages, { all = messages, images } = {}) {
+export function promptBlocks(messages, { all = messages, files } = {}) {
   if (!Array.isArray(messages) || !messages.length) throw new Error("messages must not be empty")
 
   const toolNames = new Map()
@@ -109,7 +117,7 @@ export function promptBlocks(messages, { all = messages, images } = {}) {
     const role = roleOf(m)
     if (isSystem(role)) continue
     turns++
-    const content = contentText(m.content, role === "user" || role === "tool" ? images : undefined)
+    const content = contentText(m.content, role === "user" || role === "tool" ? files : undefined)
     const hasContent = content.trim() !== ""
     onlyUserText = role === "user" ? content : null
 
