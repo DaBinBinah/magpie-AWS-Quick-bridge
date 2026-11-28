@@ -239,6 +239,15 @@ export async function compose(turn, { auth, cfg, session, thread, threadId, sign
     input.prompt = prompt
   }
 
+  if (!fits()) {
+    const last = blocks.at(-1) ?? ""
+    const context = /^(?:User: )?(?:<system-reminder>[\s\S]*?<\/system-reminder>\s*)+/.exec(last)?.[0]
+    const question = context ? last.slice(context.length) : ""
+    if (question.trim() && Buffer.byteLength(question) <= 6000) {
+      blocks.splice(-1, 1, context.trimEnd(), question)
+    }
+  }
+
   const attachments = []
   const attach = async (name, mimeType, bytes) => attachments.push(await upload(auth, { name, mimeType, bytes, threadId }, { signal }))
   if (!fits() && cfg.attachments && !gateway) {
